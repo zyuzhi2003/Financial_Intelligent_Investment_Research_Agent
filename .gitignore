@@ -1,0 +1,6 @@
+# 这个文件用于忽略本地环境和向量库等不应提交到仓库的文件。
+.venv/
+__pycache__/
+*.pyc
+.env
+data/chroma/
