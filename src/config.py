@@ -23,10 +23,26 @@ class Settings:
     collection_name: str
     openai_base_url: str
     openai_model: str
+    openai_api_key: str
 
 
 def _to_bool(value: str) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _get_required_env(name: str) -> str:
+    value = os.getenv(name, "").strip()
+    if not value:
+        raise EnvironmentError(f"缺少{name}，请先在.env中配置。")
+    return value
+
+
+def _get_env_with_alias(*names: str) -> str:
+    for name in names:
+        value = os.getenv(name, "").strip()
+        if value:
+            return value
+    return ""
 
 
 def load_settings() -> Settings:
@@ -36,7 +52,7 @@ def load_settings() -> Settings:
     return Settings(
         knowledge_dir=Path(os.getenv("KNOWLEDGE_DIR", project_root / "Knowledge")),
         persist_dir=Path(os.getenv("CHROMA_PERSIST_DIR", project_root / "data" / "chroma")),
-        embedding_model_name=os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-zh-v1.5"),
+        embedding_model_name=_get_required_env("EMBEDDING_MODEL"),
         hf_endpoint=os.getenv("HF_ENDPOINT", "https://hf-mirror.com"),
         enable_ocr=_to_bool(os.getenv("ENABLE_OCR", "true")),
         ocr_dpi=int(os.getenv("OCR_DPI", "200")),
@@ -45,6 +61,7 @@ def load_settings() -> Settings:
         chunk_overlap=int(os.getenv("CHUNK_OVERLAP", "120")),
         top_k=int(os.getenv("TOP_K", "4")),
         collection_name=os.getenv("CHROMA_COLLECTION", "bank_research_reports"),
-        openai_base_url=os.getenv("OPENAI_BASE_URL", "https://api.deepseek.com/v1"),
-        openai_model=os.getenv("OPENAI_MODEL", "deepseek-chat"),
+        openai_base_url=_get_required_env("OPENAI_BASE_URL"),
+        openai_model=_get_required_env("OPENAI_MODEL"),
+        openai_api_key=_get_env_with_alias("OPENAI_API_KEY", "DEEPSEEK_API_KEY"),
     )

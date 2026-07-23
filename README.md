@@ -31,11 +31,12 @@
 - 模型接入：`ChatOpenAI`（通过OpenAI兼容协议调用DeepSeek）
 - 环境变量管理：`python-dotenv`
 
-默认关键配置（可在 `.env` 覆盖）：
+关键配置统一在 `.env` 中维护（代码侧不再硬编码模型名）：
 
-- `EMBEDDING_MODEL=BAAI/bge-small-zh-v1.5`
+- `EMBEDDING_MODEL=BAAI/bge-small-zh-v1.5` （中文环境适配度高，若是英文研报，建议换成`EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2`
 - `OPENAI_MODEL=deepseek-chat`
 - `OPENAI_BASE_URL=https://api.deepseek.com/v1`
+- `OPENAI_API_KEY=...`（推荐）或 `DEEPSEEK_API_KEY=...`（兼容）
 - `HF_ENDPOINT=https://hf-mirror.com`
 - `ENABLE_OCR=true`
 - `OCR_DPI=200`
@@ -55,7 +56,10 @@ pip install -r requirements.txt
 Copy-Item .env.example .env
 ```
 
-把 `.env` 中的 `DEEPSEEK_API_KEY` 改成你的Key（默认已配置为DeepSeek Flash兼容接口）。
+- `EMBEDDING_MODEL`
+- `OPENAI_MODEL`
+- `OPENAI_BASE_URL`
+- `OPENAI_API_KEY`（或 `DEEPSEEK_API_KEY`）
 
 ## 3. 构建向量库
 

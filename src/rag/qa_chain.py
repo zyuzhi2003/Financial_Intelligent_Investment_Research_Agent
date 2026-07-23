@@ -1,7 +1,6 @@
 # 这个文件用于组装“检索 + 生成”的问答链并返回答案与引用来源。
 from __future__ import annotations
 
-import os
 from typing import Any
 
 from langchain_core.documents import Document
@@ -25,9 +24,8 @@ def _format_sources(docs: list[Document]) -> list[str]:
 
 
 def ask_with_rag(settings: Settings, question: str) -> dict[str, Any]:
-    api_key = os.getenv("DEEPSEEK_API_KEY") or os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise EnvironmentError("缺少DEEPSEEK_API_KEY（或OPENAI_API_KEY），请先在.env中配置。")
+    if not settings.openai_api_key:
+        raise EnvironmentError("缺少OPENAI_API_KEY（或DEEPSEEK_API_KEY），请先在.env中配置。")
 
     retriever = get_retriever(settings)
     docs: list[Document] = retriever.invoke(question)
@@ -36,7 +34,7 @@ def ask_with_rag(settings: Settings, question: str) -> dict[str, Any]:
     llm = ChatOpenAI(
         model=settings.openai_model,
         temperature=0,
-        api_key=api_key,
+        api_key=settings.openai_api_key,
         base_url=settings.openai_base_url,
     )
     messages = [
