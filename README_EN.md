@@ -4,25 +4,28 @@ Language: [中文](README.md) | English
 
 ## Table of Contents
 
-- [1. Capabilities](#1-capabilities)
-- [2. Models and Tech Stack](#2-models-and-tech-stack)
-- [3. Architecture](#3-architecture)
-- [4. Run Guide](#4-run-guide)
-  - [4.1 Install dependencies](#41-install-dependencies)
-  - [4.2 Configure environment](#42-configure-environment)
-  - [4.3 Build index](#43-build-index)
-  - [4.4 Common commands](#44-common-commands)
-- [5. Common Errors](#5-common-errors)
-- [6. Future Roadmap](#6-future-roadmap)
-  - [6.1 MCP capability expansion](#61-mcp-capability-expansion)
-  - [6.2 Vector retrieval scaling path](#62-vector-retrieval-scaling-path)
-  - [6.3 Agent evolution](#63-agent-evolution)
-- [7. How to Build Your Own Knowledge Base (Not Limited to Banking)](#7-how-to-build-your-own-knowledge-base-not-limited-to-banking)
-  - [7.1 Single-Industry Knowledge Base (Recommended Starting Point)](#71-single-industry-knowledge-base-recommended-starting-point)
-  - [7.2 Multi-Industry Knowledge Base (Scaling Path)](#72-multi-industry-knowledge-base-scaling-path)
-  - [7.3 Document Quality Criteria (Critical for Retrieval Quality)](#73-document-quality-criteria-critical-for-retrieval-quality)
-  - [7.4 Recommended Build Workflow](#74-recommended-build-workflow)
-  - [7.5 Acceptance Criteria for a High-Quality Knowledge Base](#75-acceptance-criteria-for-a-high-quality-knowledge-base)
+- [Financial Intelligent Investment Research Agent (RAG + MCP)](#financial-intelligent-investment-research-agent-rag--mcp)
+  - [Table of Contents](#table-of-contents)
+  - [1. Capabilities](#1-capabilities)
+  - [2. Models and Tech Stack](#2-models-and-tech-stack)
+  - [3. Architecture](#3-architecture)
+  - [4. Run Guide](#4-run-guide)
+    - [4.1 Install dependencies](#41-install-dependencies)
+    - [4.2 Configure environment](#42-configure-environment)
+    - [4.3 Build index](#43-build-index)
+    - [4.4 Common commands](#44-common-commands)
+  - [5. Common Errors](#5-common-errors)
+  - [6. Future Roadmap](#6-future-roadmap)
+    - [6.1 MCP capability expansion](#61-mcp-capability-expansion)
+    - [6.2 Vector retrieval scaling path](#62-vector-retrieval-scaling-path)
+    - [6.3 Agent evolution](#63-agent-evolution)
+    - [6.4 Memory mechanism evolution](#64-memory-mechanism-evolution)
+  - [7. How to Build Your Own Knowledge Base (Not Limited to Banking)](#7-how-to-build-your-own-knowledge-base-not-limited-to-banking)
+    - [7.1 Single-Industry Knowledge Base (Recommended Starting Point)](#71-single-industry-knowledge-base-recommended-starting-point)
+    - [7.2 Multi-Industry Knowledge Base (Scaling Path)](#72-multi-industry-knowledge-base-scaling-path)
+    - [7.3 Document Quality Criteria (Critical for Retrieval Quality)](#73-document-quality-criteria-critical-for-retrieval-quality)
+    - [7.4 Recommended Build Workflow](#74-recommended-build-workflow)
+    - [7.5 Acceptance Criteria for a High-Quality Knowledge Base](#75-acceptance-criteria-for-a-high-quality-knowledge-base)
 
 This project is a localized intelligent research assistant for the banking domain. It combines report retrieval (RAG) and financial calculation (MCP) into one unified agent, covering the full flow from question understanding to retrieval, tool execution, and final conclusion.
 
@@ -250,6 +253,35 @@ Chroma local persistence is suitable for demos and small-to-medium datasets. As 
 - Add end-to-end regression suites and benchmark sets.
 - Add logs and tracing for diagnosing retrieval misses and MCP parameter issues.
 - Progressively support API service deployment and multi-session concurrency.
+
+### 6.4 Memory mechanism evolution
+
+To improve continuity and personalization, a layered Memory mechanism is recommended, enabling cross-turn memory, cross-session reuse, and controlled forgetting.
+
+1. Memory layer design
+- Session Memory: stores current-session context, temporary user goals, and task state.
+- User Memory: stores long-term user preferences (language, response style, preferred metrics).
+- Project Memory: stores project-level facts such as metric definitions, folder conventions, and tool mappings.
+
+2. Recommended memory content
+- User preferences: preferred response length, chart preference, and whether to present conclusions first.
+- Business facts: sector labels, metric definitions, and unit conversion rules.
+- Execution traces: common failure patterns, fixes, and successful invocation templates.
+
+3. Typical execution flow
+- Step 1: retrieve relevant memory before routing, then enrich the current context.
+- Step 2: run intent classification and RAG/MCP orchestration.
+- Step 3: write validated new information back into memory with deduplication, categorization, and tagging.
+
+4. Governance and safety
+- Apply TTL or versioning to periodically clean outdated memory and prevent stale-fact contamination.
+- Add source validation for high-risk fields (financial conclusions and time-sensitive data).
+- Keep memory user-visible, editable, and deletable for controllability and compliance.
+
+5. Expected benefits
+- Fewer repeated clarifications and higher multi-turn efficiency.
+- Better consistency and personalization in outputs.
+- Continuous improvement of the RAG retrieval, MCP calculation, and Agent orchestration loop over long-term usage.
 
 ## 7. How to Build Your Own Knowledge Base (Not Limited to Banking)
 
