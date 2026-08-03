@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import textwrap
 import typer
 
 from src.agent import AgentRouter
@@ -9,10 +10,60 @@ from src.config import load_settings
 from src.mcp import MCPDispatcher
 from src.mcp.nl_router import build_request_from_question
 from src.rag.build_index import build_vector_index
-from src.rag.qa_chain import ask_with_rag
 from src.rag.retriever import has_index
 
 app = typer.Typer(help="金融RAG+MCP智能问答系统")
+
+
+def _print_structured_react_steps(react_steps: list[dict[str, str]]) -> None:
+    # 这个函数用于把ReAct步骤按Thought/Action/Observation分段输出，提升可读性。
+    for step in react_steps:
+        step_no = str(step.get("step", "?"))
+        thought = str(step.get("thought", ""))
+        action = str(step.get("action", ""))
+        observation = str(step.get("observation", ""))
+
+        typer.echo(f"\n[Step {step_no}]")
+        typer.echo("Thought:")
+        typer.echo(textwrap.fill(thought, width=96, initial_indent="  ", subsequent_indent="  "))
+        typer.echo("Action:")
+        typer.echo(textwrap.fill(action, width=96, initial_indent="  ", subsequent_indent="  "))
+        typer.echo("Observation:")
+        for line in observation.splitlines() or [observation]:
+            typer.echo(textwrap.fill(line, width=96, initial_indent="  ", subsequent_indent="  "))
+
+
+def _render_route_output(output, show_react_trace: bool) -> None:
+    # 这个函数用于统一输出全功能调度结果，避免ask/chat/agent-ask展示不一致。
+    typer.echo("=== 执行路径 ===")
+    typer.echo(output.route.value)
+    typer.echo("\n=== 回答 ===")
+    typer.echo(output.answer)
+
+    trace_items = output.trace
+    react_steps = output.data.get("react_steps", []) if isinstance(output.data, dict) else []
+
+    if show_react_trace and isinstance(react_steps, list) and react_steps:
+        # 这个代码块用于在结构化轨迹可用时隐藏冗长的原始ReAct行，避免重复展示。
+        trace_items = [item for item in trace_items if not str(item).startswith("ReAct:")]
+
+    if not show_react_trace:
+        # 这个代码块用于默认隐藏ReAct细粒度轨迹，只展示主调度路径。
+        trace_items = [item for item in output.trace if not str(item).startswith("ReAct:")]
+
+    if trace_items:
+        typer.echo("\n=== 调度轨迹 ===")
+        for item in trace_items:
+            typer.echo(f"- {item}")
+
+    if show_react_trace and isinstance(react_steps, list) and react_steps:
+        typer.echo("\n=== ReAct 详细轨迹 ===")
+        _print_structured_react_steps(react_steps)
+
+    if output.sources:
+        typer.echo("\n=== 参考来源 ===")
+        for source in output.sources:
+            typer.echo(f"- {source}")
 
 
 @app.command("build-index")
@@ -35,38 +86,40 @@ def build_index_cmd(
 
 
 @app.command("ask")
-def ask_cmd(question: str = typer.Option(..., "--question", "-q", help="提问内容")) -> None:
+def ask_cmd(
+    question: str = typer.Option(..., "--question", "-q", help="提问内容"),
+    show_react_trace: bool = typer.Option(False, "--show-react-trace", help="是否显示ReAct轨迹"),
+) -> None:
+    # 这个命令用于执行单次全功能调度问答（Agent+ReAct）。
     settings = load_settings()
     if not has_index(settings):
         raise typer.BadParameter("未检测到向量索引，请先执行 build-index。")
 
-    result = ask_with_rag(settings, question)
-    typer.echo("\n=== 回答 ===")
-    typer.echo(result["answer"])
-    typer.echo("\n=== 参考来源 ===")
-    for item in result["sources"]:
-        typer.echo(f"- {item}")
+    router = AgentRouter(settings)
+    output = router.ask(question)
+    _render_route_output(output, show_react_trace)
 
 
 @app.command("chat")
-def chat_cmd() -> None:
+def chat_cmd(
+    show_react_trace: bool = typer.Option(False, "--show-react-trace", help="是否显示ReAct轨迹"),
+) -> None:
+    # 这个命令用于执行交互式全功能调度问答（Agent+ReAct）。
     settings = load_settings()
     if not has_index(settings):
         raise typer.BadParameter("未检测到向量索引，请先执行 build-index。")
 
-    typer.echo("进入交互模式，输入 exit 退出。")
+    router = AgentRouter(settings)
+    typer.echo("进入全功能交互模式，输入 exit 退出。")
     while True:
         question = typer.prompt("\n你")
         if question.strip().lower() in {"exit", "quit"}:
             typer.echo("已退出。")
             break
 
-        result = ask_with_rag(settings, question)
+        output = router.ask(question)
         typer.echo("\n助手:")
-        typer.echo(result["answer"])
-        typer.echo("\n参考来源:")
-        for item in result["sources"]:
-            typer.echo(f"- {item}")
+        _render_route_output(output, show_react_trace)
 
 
 @app.command("mcp-tools")
@@ -140,23 +193,15 @@ def agent_route_cmd(question: str = typer.Option(..., "--question", "-q", help="
 
 
 @app.command("agent-ask")
-def agent_ask_cmd(question: str = typer.Option(..., "--question", "-q", help="提问内容")) -> None:
+def agent_ask_cmd(
+    question: str = typer.Option(..., "--question", "-q", help="提问内容"),
+    show_react_trace: bool = typer.Option(False, "--show-react-trace", help="是否显示ReAct轨迹"),
+) -> None:
     # 这个命令用于执行阶段四完整调度链路。
     settings = load_settings()
     router = AgentRouter(settings)
     output = router.ask(question)
-    typer.echo("=== 执行路径 ===")
-    typer.echo(output.route.value)
-    typer.echo("\n=== 回答 ===")
-    typer.echo(output.answer)
-    if output.trace:
-        typer.echo("\n=== 调度轨迹 ===")
-        for item in output.trace:
-            typer.echo(f"- {item}")
-    if output.sources:
-        typer.echo("\n=== 参考来源 ===")
-        for source in output.sources:
-            typer.echo(f"- {source}")
+    _render_route_output(output, show_react_trace)
 
 
 if __name__ == "__main__":

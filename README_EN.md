@@ -14,6 +14,7 @@ Language: [中文](README.md) | English
     - [4.2 Configure environment](#42-configure-environment)
     - [4.3 Build index](#43-build-index)
     - [4.4 Common commands](#44-common-commands)
+    - [4.5 Example outputs (real run excerpts)](#45-example-outputs-real-run-excerpts)
   - [5. Common Errors](#5-common-errors)
   - [6. Future Roadmap](#6-future-roadmap)
     - [6.1 MCP capability expansion](#61-mcp-capability-expansion)
@@ -31,7 +32,7 @@ This project is a localized intelligent research assistant for the banking domai
 
 ## 1. Capabilities
 
-The system provides four core capabilities:
+The system provides five core capabilities:
 
 1. Report-grounded Q&A (RAG)
 - Retrieves relevant passages from local banking research reports.
@@ -53,6 +54,11 @@ The system provides four core capabilities:
   - LLM-first MCP tool and parameter parsing
   - Rule-based fallback when LLM output is unavailable or malformed
 
+5. ReAct dynamic orchestration (unified Q&A entry)
+- ask / chat / agent-ask all go through Agent orchestration, with ReAct enabled per query.
+- ReAct runs as a Thought -> Action -> Observation loop, deciding whether to retrieve, compute, or finish.
+- You can inspect structured step traces via --show-react-trace for better explainability.
+
 ## 2. Models and Tech Stack
 
 Model roles:
@@ -69,6 +75,7 @@ Core components:
 - Orchestration framework: LangChain
 - Model client: ChatOpenAI
 - Environment management: python-dotenv
+- ReAct orchestrator: AgentRouter (unified multi-step reasoning and tool orchestration at the Agent layer)
 
 Key .env variables:
 
@@ -80,6 +87,8 @@ Key .env variables:
 - ENABLE_OCR=true
 - OCR_DPI=200
 - MIN_PAGE_CHARS=20
+- ENABLE_REACT=true (enable ReAct retrieval-reasoning loop)
+- REACT_MAX_STEPS=3 (maximum ReAct iterations)
 
 ## 3. Architecture
 
@@ -98,8 +107,9 @@ The system follows a four-layer design:
 
 4. Agent orchestration layer
 - LLM-first intent classification
-- Auto-routing into RAG, MCP, or hybrid reasoning
-- Structured answers with sources
+- ReAct loop driven: Thought -> Action -> Observation
+- Unified action execution: rag_retrieve (retrieve) / mcp_call (compute) / finish (stop)
+- Auto-routing into RAG, MCP, or hybrid reasoning, with structured answers and sources
 
 ## 4. Run Guide
 
@@ -133,16 +143,18 @@ python -m src.main build-index --max-pdfs 1
 
 ### 4.4 Common commands
 
-1. RAG Q&A
+1. Full-feature Q&A (Unified Agent orchestration)
 
 ```powershell
 python -m src.main ask --question "How did net interest margins trend for banks in 2024?"
+python -m src.main ask --question "How did net interest margins trend for banks in 2024?" --show-react-trace
 ```
 
-2. Interactive chat
+2. Full-feature interactive chat (Unified Agent orchestration)
 
 ```powershell
 python -m src.main chat
+python -m src.main chat --show-react-trace
 ```
 
 3. MCP tools
@@ -159,13 +171,95 @@ python -m src.main mcp-nl -q "CITIC Bank price is 8.25 and EPS is 0.68, calculat
 python -m src.main agent-route -q "Industry average PE is 13.5x, CITIC Bank price is 8.25 and EPS is 0.68, evaluate valuation"
 python -m src.main agent-ask -q "Please evaluate CITIC Bank valuation using research context. Price is 8.25 and EPS is 0.68"
 python -m src.main agent-ask -q "What is provision coverage ratio for banks?"
+python -m src.main agent-ask -q "What is provision coverage ratio for banks?" --show-react-trace
 ```
+
+Note: `ask / chat / agent-ask` now use the same full-feature orchestration path (auto-routing across RAG/MCP/hybrid) with ReAct enabled.
+`--show-react-trace` is optional. By default, fine-grained ReAct trace is hidden and only answer + route + sources are shown. Enabling this flag prints structured step-by-step traces with `Thought / Action / Observation`.
 
 5. Regression tests
 
 ```powershell
 python scripts/test_mcp_tools.py
 python scripts/test_agent_router.py
+```
+
+### 4.5 Example outputs (real run excerpts)
+
+The following excerpts are captured from real local runs for quick verification.
+
+1. ask command (full-feature orchestration, auto-routes to MCP)
+
+Command:
+
+```powershell
+python -m src.main ask --question "CITIC Bank price is 8.25 and EPS is 0.68, calculate static PE"
+```
+
+Output (excerpt):
+
+```text
+=== Route ===
+mcp_only
+
+=== Answer ===
+Static PE of CITIC Bank = Price ÷ EPS = 8.25 ÷ 0.68 ≈ 12.13x.
+
+=== Trace ===
+- LLM recognized this as a pure numeric calculation request based on price and EPS, without requiring retrieval.
+- Agent-level ReAct is enabled (Thought -> Action -> Observation).
+```
+
+2. ask command (show structured ReAct trace)
+
+Command:
+
+```powershell
+python -m src.main ask --question "What is provision coverage ratio for banks?" --show-react-trace
+```
+
+Output (excerpt):
+
+```text
+=== Route ===
+general
+
+=== Trace ===
+- LLM recognized this as a financial concept question, without mandatory retrieval or numeric computation.
+- Agent-level ReAct is enabled (Thought -> Action -> Observation).
+
+=== Detailed ReAct Trace ===
+[Step 1]
+Thought:
+  This is a definition-style question; direct completion is sufficient.
+Action:
+  finish
+Observation:
+  Loop ended and final answer returned.
+```
+
+3. agent-ask command (hybrid RAG + MCP)
+
+Command:
+
+```powershell
+python -m src.main agent-ask -q "Industry average PE is 13.5x, CITIC Bank price is 8.25 and EPS is 0.68, judge valuation" --show-react-trace
+```
+
+Output (excerpt):
+
+```text
+=== Route ===
+rag_mcp
+
+=== Trace ===
+- LLM recognized this as a hybrid request: industry benchmark retrieval + PE computation.
+- Agent-level ReAct is enabled (Thought -> Action -> Observation).
+
+=== Detailed ReAct Trace ===
+[Step 1] Action: rag_retrieve
+[Step 2] Action: mcp_call
+[Step 3] Action: rag_retrieve
 ```
 
 ## 5. Common Errors

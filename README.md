@@ -4,27 +4,29 @@
 
 ## 目录
 
-- [1. 能力介绍](#1-能力介绍)
-- [2. 模型与技术栈说明](#2-模型与技术栈说明)
-- [3. 架构介绍](#3-架构介绍)
-- [4. 运行流程](#4-运行流程)
-  - [4.1 安装依赖](#41-安装依赖)
-  - [4.2 配置环境变量](#42-配置环境变量)
-  - [4.3 构建索引](#43-构建索引)
-  - [4.4 运行方式](#44-运行方式)
-  - [4.5 运行结果示例（实测输出摘录）](#45-运行结果示例实测输出摘录)
-- [5. 常见报错](#5-常见报错)
-- [6. 未来展望](#6-未来展望)
-  - [6.1 MCP工具能力扩展](#61-mcp工具能力扩展)
-  - [6.2 向量检索架构升级路径](#62-向量检索架构升级路径)
-  - [6.3 Agent能力演进](#63-agent能力演进)
-  - [6.4 Memory机制演进](#64-memory机制演进)
-- [7. 如何构建自己的 Knowledge 库（不限银行业）](#7-如何构建自己的-knowledge-库不限银行业)
-  - [7.1 单行业知识库（推荐起步方式）](#71-单行业知识库推荐起步方式)
-  - [7.2 多行业知识库（扩展方式）](#72-多行业知识库扩展方式)
-  - [7.3 资料筛选标准（高质量知识库关键）](#73-资料筛选标准高质量知识库关键)
-  - [7.4 推荐构建流程](#74-推荐构建流程)
-  - [7.5 一个“好知识库”的验收标准](#75-一个好知识库的验收标准)
+- [金融智能投研 Agent（RAG + MCP）](#金融智能投研-agentrag--mcp)
+  - [目录](#目录)
+  - [1. 能力介绍](#1-能力介绍)
+  - [2. 模型与技术栈说明](#2-模型与技术栈说明)
+  - [3. 架构介绍](#3-架构介绍)
+  - [4. 运行流程](#4-运行流程)
+    - [4.1 安装依赖](#41-安装依赖)
+    - [4.2 配置环境变量](#42-配置环境变量)
+    - [4.3 构建索引](#43-构建索引)
+    - [4.4 运行方式](#44-运行方式)
+    - [4.5 运行结果示例（实测输出摘录）](#45-运行结果示例实测输出摘录)
+  - [5. 常见报错](#5-常见报错)
+  - [6. 未来展望](#6-未来展望)
+    - [6.1 MCP工具能力扩展](#61-mcp工具能力扩展)
+    - [6.2 向量检索架构升级路径](#62-向量检索架构升级路径)
+    - [6.3 Agent能力演进](#63-agent能力演进)
+    - [6.4 Memory机制演进](#64-memory机制演进)
+  - [7. 如何构建自己的 Knowledge 库（不限银行业）](#7-如何构建自己的-knowledge-库不限银行业)
+    - [7.1 单行业知识库（推荐起步方式）](#71-单行业知识库推荐起步方式)
+    - [7.2 多行业知识库（扩展方式）](#72-多行业知识库扩展方式)
+    - [7.3 资料筛选标准（高质量知识库关键）](#73-资料筛选标准高质量知识库关键)
+    - [7.4 推荐构建流程](#74-推荐构建流程)
+    - [7.5 一个“好知识库”的验收标准](#75-一个好知识库的验收标准)
 
 本项目是一个面向银行业场景的本地化智能投研问答系统，将“研报检索”与“财务测算”合并到一个统一Agent中，支持从问题理解、资料检索、工具计算到结论输出的完整链路。
 
@@ -52,6 +54,11 @@
   - MCP工具与参数优先由LLM解析
   - LLM异常时自动回退规则，保证可用性
 
+5. ReAct动态编排（统一问答入口）
+- `ask / chat / agent-ask` 统一走Agent调度，并在每轮问答中启用ReAct机制。
+- ReAct按 `Thought -> Action -> Observation` 闭环执行，动态决定下一步是检索、计算还是结束回答。
+- 支持通过 `--show-react-trace` 查看结构化步骤轨迹，提升过程可解释性。
+
 ## 2. 模型与技术栈说明
 
 模型分工：
@@ -68,6 +75,7 @@
 - 编排框架：`LangChain`
 - 模型接入：`ChatOpenAI`
 - 环境管理：`python-dotenv`
+- ReAct编排器：`AgentRouter`（在Agent层统一执行多步推理与工具调度）
 
 关键环境变量（`.env`）：
 
@@ -79,6 +87,8 @@
 - `ENABLE_OCR=true`
 - `OCR_DPI=200`
 - `MIN_PAGE_CHARS=20`
+- `ENABLE_REACT=true`（是否启用ReAct检索-推理循环）
+- `REACT_MAX_STEPS=3`（ReAct最多迭代步数）
 
 ## 3. 架构介绍
 
@@ -97,8 +107,9 @@
 
 4. Agent调度层
 - LLM-first意图识别
-- 自动分流到RAG、MCP或联合推理
-- 输出结构化答案与参考来源
+- ReAct循环驱动：`Thought -> Action -> Observation`
+- Action统一执行：`rag_retrieve`（检索）/ `mcp_call`（计算）/ `finish`（结束）
+- 自动分流到RAG、MCP或联合推理，并输出结构化答案与参考来源
 
 ## 4. 运行流程
 
@@ -132,16 +143,18 @@ python -m src.main build-index --max-pdfs 1
 
 ### 4.4 运行方式
 
-1. RAG问答
+1. 全功能问答（Agent统一调度）
 
 ```powershell
 python -m src.main ask --question "2026银行手续费收入利不利好？"
+python -m src.main ask --question "2026银行手续费收入利不利好？" --show-react-trace
 ```
 
-2. 交互问答
+2. 全功能交互问答（Agent统一调度）
 
 ```powershell
 python -m src.main chat
+python -m src.main chat --show-react-trace
 ```
 
 3. MCP工具（查看/调用）
@@ -158,7 +171,11 @@ python -m src.main mcp-nl -q "中信银行现价8.25元，每股收益EPS0.68，
 python -m src.main agent-route -q "股份行行业平均PE13.5倍，中信银行股价8.25元，EPS0.68，判断估值高低"
 python -m src.main agent-ask -q "请结合研报判断中信银行当前估值高低，已知股价8.25元、EPS0.68"
 python -m src.main agent-ask -q "什么是银行拨备覆盖率？"
+python -m src.main agent-ask -q "什么是银行拨备覆盖率？" --show-react-trace
 ```
+
+说明：`ask / chat / agent-ask` 现在统一走全功能调度（自动判断RAG/MCP/联合推理），并启用ReAct机制。
+`--show-react-trace` 为可选开关，默认不展示细粒度轨迹，仅输出答案、执行路径与来源；开启后会按 Step 结构展示 `Thought / Action / Observation`。
 
 5. 回归测试
 
@@ -171,100 +188,65 @@ python scripts/test_agent_router.py
 
 以下结果来自本项目在本地环境的实际运行，便于快速对照。
 
-1. MCP工具列表
+1. ask命令（全功能调度，自动走MCP）
 
 命令：
 
 ```powershell
-python -m src.main mcp-tools
-```
-
-输出：
-
-```text
-可用MCP工具：
-- calc_debt_ratio
-- calc_pe
-```
-
-2. MCP自然语言调用（PE）
-
-命令：
-
-```powershell
-python -m src.main mcp-nl -q "中信银行现价8.25元，每股收益EPS0.68，计算静态PE"
-```
-
-输出：
-
-```text
-=== MCP请求 ===
-{
-  "tool_name": "calc_pe",
-  "params": {
-    "price": 8.25,
-    "eps": 0.68
-  }
-}
-=== MCP响应 ===
-{
-  "ok": true,
-  "tool_name": "calc_pe",
-  "request_id": null,
-  "result": {
-    "value": 12.13235294117647,
-    "formula": "静态PE = 股价 ÷ EPS = 8.25 ÷ 0.68 = 12.1324",
-    "interpretation": "PE数值越高通常代表估值预期更高，需结合行业均值综合判断。"
-  },
-  "error": null
-}
-```
-
-3. Agent路由判定（联合推理场景）
-
-命令：
-
-```powershell
-python -m src.main agent-route -q "股份行行业平均PE13.5倍，中信银行股价8.25元，EPS0.68，判断估值高低"
-```
-
-输出：
-
-```text
-=== 路由结果 ===
-{
-  "route": "rag_mcp",
-  "reason": "LLM识别：用户需要行业平均PE数据（资料查询）并结合中信银行股价与EPS计算其PE（数值计算），再与行业均值对比判断估值高低，属于同时要求行业对标+数值测算的场景。"
-}
-```
-
-4. Agent完整问答（基础概念场景）
-
-命令：
-
-```powershell
-python -m src.main agent-ask -q "什么是银行拨备覆盖率？"
+python -m src.main ask --question "中信银行现价8.25元，每股收益EPS0.68，计算静态PE"
 ```
 
 输出（节选）：
 
 ```text
 === 执行路径 ===
-rag_only
+mcp_only
 
 === 回答 ===
-根据提供的研报资料，银行拨备覆盖率是衡量银行资产质量与风险抵补能力的重要指标...
+中信银行静态PE = 股价 ÷ EPS = 8.25 ÷ 0.68 ≈ 12.13倍。
 
 === 调度轨迹 ===
-- LLM识别：用户询问银行拨备覆盖率的定义，属于金融术语解释和资料查询...
+- LLM识别：用户仅要求根据给定价格和EPS计算静态PE，属于纯数值计算，无需资料查询。
+- 已启用Agent级ReAct编排（Thought -> Action -> Observation）。
 ```
 
-5. Agent完整问答（RAG+MCP联合）
+2. ask命令（展示结构化ReAct轨迹）
 
 命令：
 
 ```powershell
-python -m src.main agent-ask -q "股份行行业平均PE13.5倍，中信银行股价8.25元，EPS0.68，判断估值高低"
+python -m src.main ask --question "什么是银行拨备覆盖率？" --show-react-trace
+```
+
+输出（节选）：
+
+```text
+=== 执行路径 ===
+general
+
+=== 回答 ===
+银行拨备覆盖率是衡量银行对贷款损失准备计提充足程度的重要指标...
+
+=== 调度轨迹 ===
+- LLM识别：这是关于金融概念的常识性问答，不涉及具体资料查询或数值计算。
+- 已启用Agent级ReAct编排（Thought -> Action -> Observation）。
+
+=== ReAct 详细轨迹 ===
+[Step 1]
+Thought:
+  用户询问银行拨备覆盖率的定义，这是一个基础概念问题，不需要检索或计算，直接基于常识回答即可。
+Action:
+  finish
+Observation:
+  结束循环并产出最终回答。
+```
+
+3. agent-ask命令（RAG+MCP联合场景）
+
+命令：
+
+```powershell
+python -m src.main agent-ask -q "股份行行业平均PE13.5倍，中信银行股价8.25元，EPS0.68，判断估值高低" --show-react-trace
 ```
 
 输出（节选）：
@@ -273,17 +255,14 @@ python -m src.main agent-ask -q "股份行行业平均PE13.5倍，中信银行�
 === 执行路径 ===
 rag_mcp
 
-=== 回答 ===
-### 一、量化测算结果（MCP）
-静态PE = 股价 ÷ EPS = 8.25 ÷ 0.68 = 12.1324
-...
-### 三、对标结论（联合推理）
-行业基准PE约13.50倍，个股PE约12.13倍，当前个股低于行业中枢1.37倍。
-
 === 调度轨迹 ===
-- LLM识别：...需要同时使用RAG和MCP。
-- 先执行RAG提取基准，再执行MCP量化并自动对比。
-- 行业基准抽取来源：RAG文本（提取到PE候选=13.5）。
+- LLM识别：用户要求计算PE并结合行业均值判断，属于资料查询+数值测算联合场景。
+- 已启用Agent级ReAct编排（Thought -> Action -> Observation）。
+
+=== ReAct 详细轨迹 ===
+[Step 1] Action: rag_retrieve
+[Step 2] Action: mcp_call
+[Step 3] Action: rag_retrieve
 ```
 
 ## 5. 常见报错

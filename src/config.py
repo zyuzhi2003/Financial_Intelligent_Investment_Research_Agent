@@ -24,6 +24,8 @@ class Settings:
     openai_base_url: str
     openai_model: str
     openai_api_key: str
+    enable_react: bool = True
+    react_max_steps: int = 3
 
 
 def _to_bool(value: str) -> bool:
@@ -64,4 +66,6 @@ def load_settings() -> Settings:
         openai_base_url=_get_required_env("OPENAI_BASE_URL"),
         openai_model=_get_required_env("OPENAI_MODEL"),
         openai_api_key=_get_env_with_alias("OPENAI_API_KEY", "DEEPSEEK_API_KEY"),
+        enable_react=_to_bool(os.getenv("ENABLE_REACT", "true")),
+        react_max_steps=max(1, int(os.getenv("REACT_MAX_STEPS", "3"))),
     )
