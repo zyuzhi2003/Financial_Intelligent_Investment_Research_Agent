@@ -9,7 +9,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.agent.intent import RouteType, classify_intent
+from src.agent.intent import IntentResult, RouteType, classify_intent
 from src.agent.router import AgentRouter
 from src.config import Settings
 
@@ -63,6 +63,19 @@ def main() -> int:
         openai_api_key="",
     )
     router = AgentRouter(settings)
+
+    stabilized = router._stabilize_intent(
+        "请结合研报，股份行行业平均PE13.5倍，中信银行股价8.25元，EPS0.68，判断估值高低",
+        IntentResult(route=RouteType.MCP_ONLY, reason="mock"),
+    )
+    _assert_equal(stabilized.route, RouteType.RAG_MCP, "路由稳定化应把研报+测算纠偏到RAG_MCP")
+
+    stabilized_mcp = router._stabilize_intent(
+        "中信银行现价8.25元，每股收益EPS0.68，计算静态PE",
+        IntentResult(route=RouteType.RAG_MCP, reason="mock"),
+    )
+    _assert_equal(stabilized_mcp.route, RouteType.MCP_ONLY, "路由稳定化应把纯测算纠偏到MCP_ONLY")
+
     pe_benchmark = router._extract_benchmark_from_rag(
         question="判断估值高低",
         tool_name="calc_pe",

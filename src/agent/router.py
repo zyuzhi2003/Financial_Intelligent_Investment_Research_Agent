@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 import json
 import re
 from typing import Any
@@ -12,6 +13,7 @@ from langchain_openai import ChatOpenAI
 
 from src.agent.intent import IntentResult, RouteType, classify_intent
 from src.config import Settings
+from src.memory import HybridMemoryStore, MemoryScope
 from src.mcp import MCPDispatcher
 from src.mcp.nl_router import build_request_from_question
 from src.rag.qa_chain import ask_with_rag
@@ -74,36 +76,103 @@ class AgentRouter:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._mcp = MCPDispatcher()
+        self._memory = self._build_memory_store()
+        self._profile_candidate_min_confidence = 0.45
+
+    def _build_memory_store(self) -> HybridMemoryStore | None:
+        # 这个函数用于按配置创建记忆存储实例。
+        if not self._settings.memory_enabled:
+            return None
+        try:
+            return HybridMemoryStore(self._settings)
+        except Exception:  # noqa: BLE001
+            return None
 
     def route_only(self, question: str) -> IntentResult:
         # 这个方法用于仅返回意图识别结果。
         return classify_intent(question, self._settings)
 
-    def ask(self, question: str) -> RouteOutput:
+    def ask(self, question: str, *, user_id: str = "", session_id: str = "") -> RouteOutput:
         # 这个方法用于执行四类场景自动分流。
         intent = classify_intent(question, self._settings)
+        intent = self._stabilize_intent(question, intent)
+        memory_context, memory_stats = self._load_memory_context(
+            question=question,
+            user_id=user_id,
+            session_id=session_id,
+        )
 
+        output: RouteOutput
         if self._settings.enable_react:
             # 这个分支用于优先启用Agent级ReAct编排；失败时回退原有路径。
             try:
-                return self._handle_agent_level_react(question, intent)
+                output = self._handle_agent_level_react(question, intent, memory_context=memory_context)
+                return self._finalize_with_memory(
+                    question=question,
+                    output=output,
+                    user_id=user_id,
+                    session_id=session_id,
+                    memory_stats=memory_stats,
+                )
             except Exception:  # noqa: BLE001
                 pass
 
-        return self._dispatch_legacy(question, intent)
+        output = self._dispatch_legacy(question, intent, memory_context=memory_context)
+        return self._finalize_with_memory(
+            question=question,
+            output=output,
+            user_id=user_id,
+            session_id=session_id,
+            memory_stats=memory_stats,
+        )
 
-    def _dispatch_legacy(self, question: str, intent: IntentResult) -> RouteOutput:
+    @staticmethod
+    def _contains_any(text: str, keywords: list[str]) -> bool:
+        # 这个函数用于复用关键词匹配逻辑。
+        return any(keyword in text for keyword in keywords)
+
+    def _stabilize_intent(self, question: str, intent: IntentResult) -> IntentResult:
+        # 这个函数用于对LLM路由结果做硬规则纠偏，降低mcp_only与rag_mcp漂移。
+        raw = question.strip()
+        lower = raw.lower()
+
+        has_numeric = any(char.isdigit() for char in raw)
+        has_metric = self._contains_any(lower, ["pe", "市盈率", "资产负债率"])
+        has_calc = self._contains_any(raw, ["计算", "测算", "估值", "估值高低", "高估", "低估", "判断估值", "估值水平"])
+        has_research = self._contains_any(
+            raw,
+            ["结合研报", "研报", "行业", "同业", "平均", "基准", "中枢", "区间", "对标", "政策", "走势"],
+        )
+
+        target_route: RouteType | None = None
+        reason = ""
+        if has_metric and has_numeric and has_research:
+            target_route = RouteType.RAG_MCP
+            reason = "检测到行业/研报对标与数值测算并存，固定走rag_mcp。"
+        elif has_metric and has_numeric and has_calc:
+            target_route = RouteType.MCP_ONLY
+            reason = "检测到指标测算且无检索信号，固定走mcp_only。"
+
+        if target_route is None or target_route == intent.route:
+            return intent
+
+        return IntentResult(
+            route=target_route,
+            reason=f"{intent.reason} | 路由稳定化修正：{reason}",
+        )
+
+    def _dispatch_legacy(self, question: str, intent: IntentResult, *, memory_context: str = "") -> RouteOutput:
         # 这个方法用于保留原有稳定路由逻辑作为兜底。
         if intent.route == RouteType.MCP_ONLY:
             return self._handle_mcp_only(question, intent)
 
         if intent.route == RouteType.RAG_ONLY:
-            return self._handle_rag_only(question, intent)
+            return self._handle_rag_only(question, intent, memory_context=memory_context)
 
         if intent.route == RouteType.RAG_MCP:
-            return self._handle_rag_mcp(question, intent)
+            return self._handle_rag_mcp(question, intent, memory_context=memory_context)
 
-        return self._handle_general(question, intent)
+        return self._handle_general(question, intent, memory_context=memory_context)
 
     @staticmethod
     def _extract_json(text: str) -> dict[str, Any]:
@@ -177,12 +246,310 @@ class AgentRouter:
         interpretation = str(result.get("interpretation", "无解读"))
         return f"MCP结果: {formula} | 解读: {interpretation}"
 
+    @staticmethod
+    def _with_memory_context(question: str, memory_context: str) -> str:
+        # 这个函数用于把记忆上下文拼接到问题中供下游链路使用。
+        if not memory_context.strip():
+            return question
+        return f"{question}\n\n[记忆上下文]\n{memory_context}"
+
+    def _format_memory_records(self, records: list[Any]) -> str:
+        # 这个函数用于把命中记忆压缩为可注入的简洁文本。
+        lines: list[str] = []
+        for idx, record in enumerate(records, start=1):
+            lines.append(f"{idx}. ({record.scope.value}) {self._truncate(record.text, max_len=140)}")
+        return "\n".join(lines)
+
+    def _load_memory_context(
+        self,
+        *,
+        question: str,
+        user_id: str,
+        session_id: str,
+    ) -> tuple[str, dict[str, Any]]:
+        # 这个函数用于汇总三类记忆并返回上下文与统计信息。
+        if self._memory is None:
+            return "", {"recalled_count": 0, "scope_counts": {}, "enabled": False}
+
+        scope_counts = {"session": 0, "user": 0, "project": 0}
+        recalled_records: list[Any] = []
+
+        if session_id.strip():
+            session_records = self._memory.recall(
+                query=question,
+                scope=MemoryScope.SESSION,
+                top_k=self._settings.memory_top_k,
+                user_id=user_id,
+                session_id=session_id,
+            )
+            scope_counts["session"] = len(session_records)
+            recalled_records.extend(session_records)
+
+        if user_id.strip():
+            user_records = self._memory.recall(
+                query=question,
+                scope=MemoryScope.USER,
+                top_k=self._settings.memory_top_k,
+                user_id=user_id,
+                session_id="",
+            )
+            scope_counts["user"] = len(user_records)
+            recalled_records.extend(user_records)
+
+        project_records = self._memory.recall(
+            query=question,
+            scope=MemoryScope.PROJECT,
+            top_k=self._settings.memory_top_k,
+            user_id="",
+            session_id="",
+        )
+        scope_counts["project"] = len(project_records)
+        recalled_records.extend(project_records)
+
+        memory_context = self._format_memory_records(recalled_records)
+        return memory_context, {
+            "enabled": True,
+            "recalled_count": len(recalled_records),
+            "scope_counts": scope_counts,
+            "preview": self._truncate(memory_context, max_len=220) if memory_context else "",
+        }
+
+    def _extract_user_profile_payload(self, *, question: str, answer: str) -> dict[str, Any] | None:
+        # 这个函数用于通过LLM自动总结用户偏好并输出结构化画像。
+        if not self._settings.openai_api_key:
+            return None
+
+        llm = ChatOpenAI(
+            model=self._settings.openai_model,
+            temperature=0,
+            api_key=self._settings.openai_api_key,
+            base_url=self._settings.openai_base_url,
+        )
+        messages = [
+            SystemMessage(
+                content=(
+                    "你是用户画像提取器。"
+                    "请根据本轮问答提取用户偏好，输出严格JSON，不允许额外文本。"
+                    "JSON格式: {"
+                    "\"risk_preference\":\"...\","
+                    "\"investment_horizon\":\"...\","
+                    "\"output_style\":\"...\","
+                    "\"focus_topics\":[\"...\"],"
+                    "\"language_preference\":\"...\","
+                    "\"confidence\":0.0"
+                    "}。"
+                )
+            ),
+            HumanMessage(content=f"用户问题:\n{question}\n\n助手回答:\n{answer}"),
+        ]
+        result = llm.invoke(messages)
+        payload = self._extract_json(str(result.content))
+        return self._normalize_profile_payload(payload)
+
+    @staticmethod
+    def _normalize_profile_payload(payload: dict[str, Any]) -> dict[str, Any]:
+        # 这个函数用于规整用户画像字段，防止脏值污染长期记忆。
+        def clean_text(value: Any) -> str:
+            text = str(value or "").strip()
+            if text in {"无", "未知", "不确定", "N/A", "na"}:
+                return ""
+            return text
+
+        confidence = float(payload.get("confidence", 0.0))
+        topics_raw = payload.get("focus_topics", [])
+        topics: list[str] = []
+        if isinstance(topics_raw, list):
+            for item in topics_raw:
+                topic = clean_text(item)
+                if topic and topic not in topics:
+                    topics.append(topic)
+
+        return {
+            "risk_preference": clean_text(payload.get("risk_preference", "")),
+            "investment_horizon": clean_text(payload.get("investment_horizon", "")),
+            "output_style": clean_text(payload.get("output_style", "")),
+            "focus_topics": topics[:8],
+            "language_preference": clean_text(payload.get("language_preference", "")),
+            "confidence": max(0.0, min(1.0, confidence)),
+        }
+
+    @staticmethod
+    def _merge_profile_payload(existing: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
+        # 这个函数用于把候选画像与已确认画像合并，避免低质量覆盖。
+        merged = dict(existing)
+        for key in ["risk_preference", "investment_horizon", "output_style", "language_preference"]:
+            candidate_value = str(candidate.get(key, "")).strip()
+            if candidate_value:
+                merged[key] = candidate_value
+            else:
+                merged[key] = str(existing.get(key, "")).strip()
+
+        topic_pool: list[str] = []
+        for source in [existing.get("focus_topics", []), candidate.get("focus_topics", [])]:
+            if isinstance(source, list):
+                for topic in source:
+                    normalized = str(topic).strip()
+                    if normalized and normalized not in topic_pool:
+                        topic_pool.append(normalized)
+        merged["focus_topics"] = topic_pool[:8]
+        merged["confidence"] = max(
+            float(existing.get("confidence", 0.0)),
+            float(candidate.get("confidence", 0.0)),
+        )
+        return merged
+
+    @staticmethod
+    def _profile_payload_to_text(payload: dict[str, Any]) -> str:
+        # 这个函数用于把结构化画像格式化为可检索文本。
+        return (
+            f"风险偏好={payload.get('risk_preference', '')}; "
+            f"投资期限={payload.get('investment_horizon', '')}; "
+            f"输出风格={payload.get('output_style', '')}; "
+            f"语言偏好={payload.get('language_preference', '')}; "
+            f"关注主题={','.join(payload.get('focus_topics', []))}"
+        )
+
+    def _write_turn_memory(
+        self,
+        *,
+        question: str,
+        answer: str,
+        route: RouteType,
+        sources: list[str],
+        user_id: str,
+        session_id: str,
+    ) -> str:
+        # 这个函数用于写回会话、用户与项目记忆。
+        if self._memory is None:
+            return "disabled"
+
+        status_fragments: list[str] = []
+        try:
+            expire_at = self._memory.default_expiration()
+            self._memory.prune_expired(now=datetime.now(expire_at.tzinfo))
+
+            if session_id.strip():
+                self._memory.put(
+                    scope=MemoryScope.SESSION,
+                    text=f"Q: {question}\nA: {self._truncate(answer, max_len=260)}",
+                    user_id=user_id,
+                    session_id=session_id,
+                    tags=["turn", route.value],
+                    payload={"sources": sources[:3]},
+                    importance=0.6,
+                    expires_at=expire_at,
+                )
+                status_fragments.append("session:ok")
+            else:
+                status_fragments.append("session:skip")
+
+            if user_id.strip():
+                profile_payload = self._extract_user_profile_payload(question=question, answer=answer)
+                if profile_payload is not None:
+                    confidence = float(profile_payload.get("confidence", 0.0))
+                    if confidence >= self._settings.memory_profile_min_confidence:
+                        latest_rows = self._memory.list_recent(
+                            scope=MemoryScope.USER,
+                            limit=1,
+                            user_id=user_id,
+                            session_id="",
+                        )
+                        existing_payload = latest_rows[0].payload if latest_rows else {}
+                        merged_payload = self._merge_profile_payload(existing_payload, profile_payload)
+                        profile_text = self._profile_payload_to_text(merged_payload)
+                        if latest_rows and latest_rows[0].text == profile_text:
+                            status_fragments.append("user:unchanged")
+                        else:
+                            self._memory.put(
+                                scope=MemoryScope.USER,
+                                text=profile_text,
+                                user_id=user_id,
+                                session_id="",
+                                tags=["user_profile", "auto_summary", "merged_update"],
+                                payload=merged_payload,
+                                importance=0.8,
+                                expires_at=expire_at,
+                            )
+                            status_fragments.append("user:confirmed")
+                    elif confidence >= self._profile_candidate_min_confidence:
+                        candidate_text = self._profile_payload_to_text(profile_payload)
+                        self._memory.put(
+                            scope=MemoryScope.USER,
+                            text=f"候选画像: {candidate_text}",
+                            user_id=user_id,
+                            session_id="",
+                            tags=["user_profile_candidate", "auto_summary"],
+                            payload=profile_payload,
+                            importance=0.35,
+                            expires_at=expire_at,
+                        )
+                        status_fragments.append("user:candidate")
+                    else:
+                        status_fragments.append("user:low_confidence")
+                else:
+                    status_fragments.append("user:no_payload")
+            else:
+                status_fragments.append("user:skip")
+
+            if route in {RouteType.RAG_ONLY, RouteType.RAG_MCP}:
+                project_summary = f"问题: {question}\n结论: {self._truncate(answer, max_len=220)}"
+                self._memory.put(
+                    scope=MemoryScope.PROJECT,
+                    text=project_summary,
+                    user_id="",
+                    session_id="",
+                    tags=["project_fact", route.value],
+                    payload={"sources": sources[:5]},
+                    importance=0.65,
+                    expires_at=expire_at,
+                )
+                status_fragments.append("project:ok")
+            else:
+                status_fragments.append("project:skip")
+        except Exception as exc:  # noqa: BLE001
+            return f"failed:{exc}"
+
+        return "ok|" + ",".join(status_fragments)
+
+    def _finalize_with_memory(
+        self,
+        *,
+        question: str,
+        output: RouteOutput,
+        user_id: str,
+        session_id: str,
+        memory_stats: dict[str, Any],
+    ) -> RouteOutput:
+        # 这个函数用于附加memory trace并执行写回。
+        write_status = self._write_turn_memory(
+            question=question,
+            answer=output.answer,
+            route=output.route,
+            sources=output.sources,
+            user_id=user_id,
+            session_id=session_id,
+        )
+        data = dict(output.data)
+        data["memory"] = {
+            **memory_stats,
+            "write_status": write_status,
+            "embedding_error": self._memory.embedding_error if self._memory is not None else "",
+        }
+        return RouteOutput(
+            output.route,
+            output.answer,
+            output.trace,
+            output.sources,
+            data,
+        )
+
     def _synthesize_answer(
         self,
         *,
         question: str,
         docs: list[Document],
         mcp_records: list[dict[str, Any]],
+        memory_context: str = "",
     ) -> str:
         # 这个函数用于在ReAct未直接给出final_answer时综合生成最终答案。
         if not self._settings.openai_api_key:
@@ -210,6 +577,7 @@ class AgentRouter:
             HumanMessage(
                 content=(
                     f"用户问题:\n{question}\n\n"
+                    f"记忆上下文:\n{(memory_context or '无')}\n\n"
                     f"RAG片段:\n{context}\n\n"
                     f"MCP结果:\n{mcp_text}\n\n"
                     "请输出最终回答。"
@@ -219,10 +587,16 @@ class AgentRouter:
         result = llm.invoke(messages)
         return str(result.content)
 
-    def _handle_agent_level_react(self, question: str, intent: IntentResult) -> RouteOutput:
+    def _handle_agent_level_react(
+        self,
+        question: str,
+        intent: IntentResult,
+        *,
+        memory_context: str = "",
+    ) -> RouteOutput:
         # 这个方法用于在Agent层统一执行Thought->Action->Observation循环。
         if not self._settings.openai_api_key:
-            return self._dispatch_legacy(question, intent)
+            return self._dispatch_legacy(question, intent, memory_context=memory_context)
 
         llm = ChatOpenAI(
             model=self._settings.openai_model,
@@ -248,6 +622,7 @@ class AgentRouter:
                 HumanMessage(
                     content=(
                         f"用户问题:\n{question}\n\n"
+                        f"记忆上下文:\n{(memory_context or '无')}\n\n"
                         f"当前路由提示:\n{intent.route.value}\n\n"
                         f"历史观察:\n{chr(10).join(observation_history)}\n\n"
                         "请输出本轮JSON决策。"
@@ -270,6 +645,7 @@ class AgentRouter:
                     question=question,
                     docs=rag_pool,
                     mcp_records=mcp_records,
+                    memory_context=memory_context,
                 )
                 observation = "结束循环并产出最终回答。"
                 trace.append(f"ReAct: Step {step} | Action: finish")
@@ -346,6 +722,7 @@ class AgentRouter:
                 question=question,
                 docs=rag_pool,
                 mcp_records=mcp_records,
+                memory_context=memory_context,
             )
             trace.append("ReAct: 未在限制步数内finish，已自动合成最终答案。")
 
@@ -378,9 +755,15 @@ class AgentRouter:
         )
         return RouteOutput(intent.route, answer, [intent.reason], [], {"mcp": response})
 
-    def _handle_rag_only(self, question: str, intent: IntentResult) -> RouteOutput:
+    def _handle_rag_only(
+        self,
+        question: str,
+        intent: IntentResult,
+        *,
+        memory_context: str = "",
+    ) -> RouteOutput:
         # 这个方法用于执行纯RAG检索问答路径。
-        rag_result = ask_with_rag(self._settings, question)
+        rag_result = ask_with_rag(self._settings, self._with_memory_context(question, memory_context))
         trace = [intent.reason]
         react_trace = rag_result.get("react_trace", [])
         if isinstance(react_trace, list):
@@ -393,9 +776,15 @@ class AgentRouter:
             {"rag": rag_result},
         )
 
-    def _handle_rag_mcp(self, question: str, intent: IntentResult) -> RouteOutput:
+    def _handle_rag_mcp(
+        self,
+        question: str,
+        intent: IntentResult,
+        *,
+        memory_context: str = "",
+    ) -> RouteOutput:
         # 这个方法用于执行先RAG后MCP的联合推理路径。
-        rag_result = ask_with_rag(self._settings, question)
+        rag_result = ask_with_rag(self._settings, self._with_memory_context(question, memory_context))
         mcp_request = build_request_from_question(question, self._settings)
         mcp_response = self._mcp.handle(mcp_request)
 
@@ -455,8 +844,15 @@ class AgentRouter:
             },
         )
 
-    def _handle_general(self, question: str, intent: IntentResult) -> RouteOutput:
+    def _handle_general(
+        self,
+        question: str,
+        intent: IntentResult,
+        *,
+        memory_context: str = "",
+    ) -> RouteOutput:
         # 这个方法用于回复无需检索与计算的基础常识问题。
+        _ = memory_context
         answer = self._general_answer(question)
         return RouteOutput(intent.route, answer, [intent.reason], [], {})
 

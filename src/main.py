@@ -1,12 +1,15 @@
 # 这个文件用于提供命令行入口，支持构建索引、单次问答和交互式问答。
 from __future__ import annotations
 
+from datetime import datetime
 import json
 import textwrap
+import uuid
 import typer
 
 from src.agent import AgentRouter
 from src.config import load_settings
+from src.memory import HybridMemoryStore, MemoryScope
 from src.mcp import MCPDispatcher
 from src.mcp.nl_router import build_request_from_question
 from src.rag.build_index import build_vector_index
@@ -66,6 +69,19 @@ def _render_route_output(output, show_react_trace: bool) -> None:
             typer.echo(f"- {source}")
 
 
+def _to_memory_scope(scope: str) -> MemoryScope:
+    # 这个函数用于把命令行scope参数转换为枚举值。
+    normalized = scope.strip().lower()
+    mapping = {
+        "session": MemoryScope.SESSION,
+        "user": MemoryScope.USER,
+        "project": MemoryScope.PROJECT,
+    }
+    if normalized not in mapping:
+        raise typer.BadParameter("scope仅支持session/user/project。")
+    return mapping[normalized]
+
+
 @app.command("build-index")
 def build_index_cmd(
     max_pdfs: int = typer.Option(0, "--max-pdfs", help="仅处理前N个PDF，0表示全部"),
@@ -88,6 +104,8 @@ def build_index_cmd(
 @app.command("ask")
 def ask_cmd(
     question: str = typer.Option(..., "--question", "-q", help="提问内容"),
+    user_id: str = typer.Option("", "--user-id", help="用户身份ID（用于用户记忆）"),
+    session_id: str = typer.Option("", "--session-id", help="会话ID（用于短期记忆）"),
     show_react_trace: bool = typer.Option(False, "--show-react-trace", help="是否显示ReAct轨迹"),
 ) -> None:
     # 这个命令用于执行单次全功能调度问答（Agent+ReAct）。
@@ -96,12 +114,14 @@ def ask_cmd(
         raise typer.BadParameter("未检测到向量索引，请先执行 build-index。")
 
     router = AgentRouter(settings)
-    output = router.ask(question)
+    output = router.ask(question, user_id=user_id, session_id=session_id)
     _render_route_output(output, show_react_trace)
 
 
 @app.command("chat")
 def chat_cmd(
+    user_id: str = typer.Option("", "--user-id", help="用户身份ID（用于用户记忆）"),
+    session_id: str = typer.Option("", "--session-id", help="会话ID（默认自动生成）"),
     show_react_trace: bool = typer.Option(False, "--show-react-trace", help="是否显示ReAct轨迹"),
 ) -> None:
     # 这个命令用于执行交互式全功能调度问答（Agent+ReAct）。
@@ -110,14 +130,16 @@ def chat_cmd(
         raise typer.BadParameter("未检测到向量索引，请先执行 build-index。")
 
     router = AgentRouter(settings)
+    active_session_id = session_id.strip() or f"chat-{uuid.uuid4()}"
     typer.echo("进入全功能交互模式，输入 exit 退出。")
+    typer.echo(f"当前session_id: {active_session_id}")
     while True:
         question = typer.prompt("\n你")
         if question.strip().lower() in {"exit", "quit"}:
             typer.echo("已退出。")
             break
 
-        output = router.ask(question)
+        output = router.ask(question, user_id=user_id, session_id=active_session_id)
         typer.echo("\n助手:")
         _render_route_output(output, show_react_trace)
 
@@ -195,13 +217,150 @@ def agent_route_cmd(question: str = typer.Option(..., "--question", "-q", help="
 @app.command("agent-ask")
 def agent_ask_cmd(
     question: str = typer.Option(..., "--question", "-q", help="提问内容"),
+    user_id: str = typer.Option("", "--user-id", help="用户身份ID（用于用户记忆）"),
+    session_id: str = typer.Option("", "--session-id", help="会话ID（用于短期记忆）"),
     show_react_trace: bool = typer.Option(False, "--show-react-trace", help="是否显示ReAct轨迹"),
 ) -> None:
     # 这个命令用于执行阶段四完整调度链路。
     settings = load_settings()
     router = AgentRouter(settings)
-    output = router.ask(question)
+    output = router.ask(question, user_id=user_id, session_id=session_id)
     _render_route_output(output, show_react_trace)
+
+
+@app.command("memory-put")
+def memory_put_cmd(
+    scope: str = typer.Option(..., "--scope", help="记忆作用域: session/user/project"),
+    text: str = typer.Option(..., "--text", help="记忆内容"),
+    user_id: str = typer.Option("", "--user-id", help="用户ID"),
+    session_id: str = typer.Option("", "--session-id", help="会话ID"),
+    importance: float = typer.Option(0.5, "--importance", help="重要度[0,1]"),
+) -> None:
+    # 这个命令用于手动写入一条记忆记录。
+    settings = load_settings()
+    store = HybridMemoryStore(settings)
+    memory_scope = _to_memory_scope(scope)
+    expire_at = store.default_expiration()
+    item_id = store.put(
+        scope=memory_scope,
+        text=text,
+        user_id=user_id,
+        session_id=session_id,
+        tags=["manual_put"],
+        payload={},
+        importance=importance,
+        expires_at=expire_at,
+    )
+    typer.echo(json.dumps({"ok": True, "item_id": item_id, "expires_at": expire_at.isoformat()}, ensure_ascii=False, indent=2))
+
+
+@app.command("memory-search")
+def memory_search_cmd(
+    query: str = typer.Option(..., "--query", "-q", help="搜索查询"),
+    scope: str = typer.Option(..., "--scope", help="记忆作用域: session/user/project"),
+    user_id: str = typer.Option("", "--user-id", help="用户ID"),
+    session_id: str = typer.Option("", "--session-id", help="会话ID"),
+    top_k: int = typer.Option(5, "--top-k", help="返回条数"),
+) -> None:
+    # 这个命令用于按语义召回记忆记录。
+    settings = load_settings()
+    store = HybridMemoryStore(settings)
+    memory_scope = _to_memory_scope(scope)
+    rows = store.recall(
+        query=query,
+        scope=memory_scope,
+        top_k=max(1, top_k),
+        user_id=user_id,
+        session_id=session_id,
+    )
+    typer.echo(
+        json.dumps(
+            {
+                "ok": True,
+                "count": len(rows),
+                "items": [
+                    {
+                        "item_id": row.item_id,
+                        "scope": row.scope.value,
+                        "user_id": row.user_id,
+                        "session_id": row.session_id,
+                        "text": row.text,
+                        "tags": row.tags,
+                        "importance": row.importance,
+                        "updated_at": row.updated_at.isoformat(),
+                    }
+                    for row in rows
+                ],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+
+
+@app.command("memory-list")
+def memory_list_cmd(
+    scope: str = typer.Option(..., "--scope", help="记忆作用域: session/user/project"),
+    user_id: str = typer.Option("", "--user-id", help="用户ID"),
+    session_id: str = typer.Option("", "--session-id", help="会话ID"),
+    limit: int = typer.Option(10, "--limit", help="返回条数"),
+) -> None:
+    # 这个命令用于按时间列出最近记忆。
+    settings = load_settings()
+    store = HybridMemoryStore(settings)
+    memory_scope = _to_memory_scope(scope)
+    rows = store.list_recent(
+        scope=memory_scope,
+        limit=max(1, limit),
+        user_id=user_id,
+        session_id=session_id,
+    )
+    typer.echo(
+        json.dumps(
+            {
+                "ok": True,
+                "count": len(rows),
+                "items": [
+                    {
+                        "item_id": row.item_id,
+                        "scope": row.scope.value,
+                        "user_id": row.user_id,
+                        "session_id": row.session_id,
+                        "text": row.text,
+                        "tags": row.tags,
+                        "importance": row.importance,
+                        "updated_at": row.updated_at.isoformat(),
+                    }
+                    for row in rows
+                ],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+
+
+@app.command("memory-prune")
+def memory_prune_cmd() -> None:
+    # 这个命令用于清理所有已过期记忆。
+    settings = load_settings()
+    store = HybridMemoryStore(settings)
+    removed = store.prune_expired(now=datetime.now(store.default_expiration().tzinfo))
+    typer.echo(json.dumps({"ok": True, "removed": removed}, ensure_ascii=False, indent=2))
+
+
+@app.command("memory-clear")
+def memory_clear_cmd(
+    scope: str = typer.Option("", "--scope", help="可选，session/user/project"),
+    user_id: str = typer.Option("", "--user-id", help="可选，用户ID"),
+    session_id: str = typer.Option("", "--session-id", help="可选，会话ID"),
+) -> None:
+    # 这个命令用于按过滤条件清空记忆。
+    settings = load_settings()
+    store = HybridMemoryStore(settings)
+    memory_scope = _to_memory_scope(scope) if scope.strip() else None
+    removed = store.clear(scope=memory_scope, user_id=user_id, session_id=session_id)
+    typer.echo(json.dumps({"ok": True, "removed": removed}, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

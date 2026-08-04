@@ -14,7 +14,8 @@
     - [4.2 配置环境变量](#42-配置环境变量)
     - [4.3 构建索引](#43-构建索引)
     - [4.4 运行方式](#44-运行方式)
-    - [4.5 运行结果示例（实测输出摘录）](#45-运行结果示例实测输出摘录)
+    - [4.5 Memory使用（短期/用户/项目）](#45-memory使用短期用户项目)
+    - [4.6 运行结果示例（实测输出摘录）](#46-运行结果示例实测输出摘录)
   - [5. 常见报错](#5-常见报错)
   - [6. 未来展望](#6-未来展望)
     - [6.1 MCP工具能力扩展](#61-mcp工具能力扩展)
@@ -32,7 +33,7 @@
 
 ## 1. 能力介绍
 
-系统提供四类核心能力：
+系统提供六类核心能力：
 
 1. 研报检索问答（RAG）
 - 从本地银行业研报中检索相关片段并生成回答。
@@ -59,6 +60,12 @@
 - ReAct按 `Thought -> Action -> Observation` 闭环执行，动态决定下一步是检索、计算还是结束回答。
 - 支持通过 `--show-react-trace` 查看结构化步骤轨迹，提升过程可解释性。
 
+6. 分层Memory（已实现）
+- 会话记忆（session）：同一会话内记住上下文。
+- 用户记忆（user）：沉淀用户偏好（风险偏好、投资期限、输出风格等）。
+- 项目记忆（project）：沉淀可复用的项目结论。
+- 支持TTL清理、手动查询/清理、语义检索（SQLite主存 + Chroma语义层）。
+
 ## 2. 模型与技术栈说明
 
 模型分工：
@@ -76,6 +83,7 @@
 - 模型接入：`ChatOpenAI`
 - 环境管理：`python-dotenv`
 - ReAct编排器：`AgentRouter`（在Agent层统一执行多步推理与工具调度）
+- Memory存储：`SQLite + Chroma`（SQLite事实主存，Chroma语义召回）
 
 关键环境变量（`.env`）：
 
@@ -89,10 +97,17 @@
 - `MIN_PAGE_CHARS=20`
 - `ENABLE_REACT=true`（是否启用ReAct检索-推理循环）
 - `REACT_MAX_STEPS=3`（ReAct最多迭代步数）
+- `MEMORY_ENABLED=true`（是否启用Memory）
+- `MEMORY_BACKEND=hybrid`（`sqlite` / `hybrid`）
+- `MEMORY_DIR=./data/memory`
+- `MEMORY_TOP_K=3`
+- `MEMORY_TTL_DAYS=30`
+- `MEMORY_COLLECTION=agent_memory`
+- `MEMORY_PROFILE_MIN_CONFIDENCE=0.7`（用户画像确认阈值）
 
 ## 3. 架构介绍
 
-系统采用四层结构：
+系统采用五层结构：
 
 1. 数据层
 - 本地研报知识库：`Knowledge/industry_bank`、`Knowledge/stock_bank`、`Knowledge/macro_policy`
@@ -110,6 +125,11 @@
 - ReAct循环驱动：`Thought -> Action -> Observation`
 - Action统一执行：`rag_retrieve`（检索）/ `mcp_call`（计算）/ `finish`（结束）
 - 自动分流到RAG、MCP或联合推理，并输出结构化答案与参考来源
+
+5. Memory层
+- 分层记忆：`session / user / project`
+- 写入策略：会话写回、用户画像分层写回（候选/确认）、项目结论沉淀
+- 治理策略：TTL过期清理、按scope/user/session手动清理
 
 ## 4. 运行流程
 
@@ -148,6 +168,7 @@ python -m src.main build-index --max-pdfs 1
 ```powershell
 python -m src.main ask --question "2026银行手续费收入利不利好？"
 python -m src.main ask --question "2026银行手续费收入利不利好？" --show-react-trace
+python -m src.main ask --question "中信银行现价8.25元，每股收益EPS0.68，计算静态PE" --user-id u001 --session-id s001
 ```
 
 2. 全功能交互问答（Agent统一调度）
@@ -155,6 +176,7 @@ python -m src.main ask --question "2026银行手续费收入利不利好？" --s
 ```powershell
 python -m src.main chat
 python -m src.main chat --show-react-trace
+python -m src.main chat --user-id u001
 ```
 
 3. MCP工具（查看/调用）
@@ -182,9 +204,47 @@ python -m src.main agent-ask -q "什么是银行拨备覆盖率？" --show-react
 ```powershell
 python scripts/test_mcp_tools.py
 python scripts/test_agent_router.py
+python scripts/test_memory_store.py
 ```
 
-### 4.5 运行结果示例（实测输出摘录）
+### 4.5 Memory使用（短期/用户/项目）
+
+1. 开启Memory
+
+```powershell
+# .env
+MEMORY_ENABLED=true
+MEMORY_BACKEND=hybrid
+MEMORY_DIR=./data/memory
+MEMORY_TOP_K=3
+MEMORY_TTL_DAYS=30
+MEMORY_COLLECTION=agent_memory
+MEMORY_PROFILE_MIN_CONFIDENCE=0.7
+```
+
+2. 带身份问答（触发session/user记忆）
+
+```powershell
+python -m src.main agent-ask -q "我风险偏好保守，投资期限3到5年，请以后要点式回答" --user-id u001 --session-id s001
+```
+
+3. 查询记忆
+
+```powershell
+python -m src.main memory-list --scope session --user-id u001 --session-id s001 --limit 5
+python -m src.main memory-list --scope user --user-id u001 --limit 5
+python -m src.main memory-list --scope project --limit 5
+python -m src.main memory-search -q "静态PE" --scope session --user-id u001 --session-id s001 --top-k 3
+```
+
+4. 清理记忆
+
+```powershell
+python -m src.main memory-prune
+python -m src.main memory-clear --scope session --user-id u001 --session-id s001
+```
+
+### 4.6 运行结果示例（实测输出摘录）
 
 以下结果来自本项目在本地环境的实际运行，便于快速对照。
 
@@ -353,32 +413,33 @@ rag_mcp
 
 ### 6.4 Memory机制演进
 
-为提升Agent的连续性与个性化能力，建议引入分层Memory机制，支持“跨轮次记忆 + 跨会话复用 + 可控遗忘”。
+当前版本已落地分层Memory机制，并完成第二阶段第一批稳定性增强。
 
-1. Memory分层设计
-- 会话记忆（Session Memory）：记录当前会话上下文、用户临时目标、当前任务状态。
-- 用户记忆（User Memory）：沉淀用户长期偏好（语言、输出风格、常用指标）。
-- 项目记忆（Project Memory）：保存项目级事实，如口径定义、目录约定、工具映射关系。
+已实现：
 
-2. 推荐存储内容
-- 用户偏好：回答长度、图表偏好、是否优先给结论。
-- 业务事实：行业标签、指标口径、单位换算规则。
-- 执行轨迹：常见错误、修复策略、成功调用模板。
+1. 分层记忆
+- Session Memory：保存当前会话上下文。
+- User Memory：保存用户偏好画像。
+- Project Memory：保存项目级结论。
 
-3. 典型调用流程
-- 第一步：问题进入时先检索Memory，补齐用户偏好与历史上下文。
-- 第二步：再执行意图识别与RAG/MCP调度。
-- 第三步：回答后将新增有效信息写回Memory（去重、归类、打标签）。
+2. 存储与治理
+- 存储架构：SQLite主存 + Chroma语义检索。
+- 默认TTL：30天，可通过命令手动清理。
 
-4. 治理与安全策略
-- 设置TTL或版本号，定期清理过期记忆，避免“陈旧事实污染”。
-- 对高风险字段（财务结论、时间敏感数据）增加来源校验。
-- 支持用户可见、可编辑、可删除，满足可控性与合规要求。
+3. 第二阶段第一批（已实现）
+- 路由稳定化：对 `mcp_only / rag_mcp` 增加硬规则纠偏，降低同类问题漂移。
+- 用户画像写回分层：低置信度不覆盖，中置信度写“候选画像”，高置信度写“确认画像”，并与历史画像合并。
 
-5. 预期收益
-- 降低重复澄清成本，提升多轮对话效率。
-- 提升输出一致性与个性化程度。
-- 让“RAG检索 + MCP计算 + Agent调度”在长期使用中持续优化。
+后续建议：
+
+1. 注入预算与优先级
+- 对 session/user/project 记忆做预算分配与排序，降低噪声注入概率。
+
+2. 候选画像转正策略
+- 增加多轮一致性检查，避免单轮误判。
+
+3. 规则参数化
+- 将路由纠偏阈值与关键词配置化，支持按行业场景调优。
 
 ## 7. 如何构建自己的 Knowledge 库（不限银行业）
 

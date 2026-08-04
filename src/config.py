@@ -26,6 +26,13 @@ class Settings:
     openai_api_key: str
     enable_react: bool = True
     react_max_steps: int = 3
+    memory_enabled: bool = False
+    memory_backend: str = "hybrid"
+    memory_dir: Path = Path("./data/memory")
+    memory_top_k: int = 3
+    memory_ttl_days: int = 30
+    memory_collection: str = "agent_memory"
+    memory_profile_min_confidence: float = 0.7
 
 
 def _to_bool(value: str) -> bool:
@@ -68,4 +75,14 @@ def load_settings() -> Settings:
         openai_api_key=_get_env_with_alias("OPENAI_API_KEY", "DEEPSEEK_API_KEY"),
         enable_react=_to_bool(os.getenv("ENABLE_REACT", "true")),
         react_max_steps=max(1, int(os.getenv("REACT_MAX_STEPS", "3"))),
+        memory_enabled=_to_bool(os.getenv("MEMORY_ENABLED", "false")),
+        memory_backend=os.getenv("MEMORY_BACKEND", "hybrid").strip().lower(),
+        memory_dir=Path(os.getenv("MEMORY_DIR", project_root / "data" / "memory")),
+        memory_top_k=max(1, int(os.getenv("MEMORY_TOP_K", "3"))),
+        memory_ttl_days=max(1, int(os.getenv("MEMORY_TTL_DAYS", "30"))),
+        memory_collection=os.getenv("MEMORY_COLLECTION", "agent_memory").strip() or "agent_memory",
+        memory_profile_min_confidence=max(
+            0.0,
+            min(1.0, float(os.getenv("MEMORY_PROFILE_MIN_CONFIDENCE", "0.7"))),
+        ),
     )
