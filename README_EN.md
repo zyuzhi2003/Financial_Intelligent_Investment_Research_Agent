@@ -14,7 +14,8 @@ Language: [中文](README.md) | English
     - [4.2 Configure environment](#42-configure-environment)
     - [4.3 Build index](#43-build-index)
     - [4.4 Common commands](#44-common-commands)
-    - [4.5 Example outputs (real run excerpts)](#45-example-outputs-real-run-excerpts)
+    - [4.5 Chat Memory](#45-chat-memory)
+    - [4.6 Example outputs (real run excerpts)](#46-example-outputs-real-run-excerpts)
   - [5. Common Errors](#5-common-errors)
   - [6. Future Roadmap](#6-future-roadmap)
     - [6.1 MCP capability expansion](#61-mcp-capability-expansion)
@@ -56,8 +57,14 @@ The system provides five core capabilities:
 
 5. ReAct dynamic orchestration (unified Q&A entry)
 - ask / chat / agent-ask all go through Agent orchestration, with ReAct enabled per query.
+- ask / agent-ask are stateless single-turn calls; chat provides stateful multi-turn conversation within a session.
 - ReAct runs as a Thought -> Action -> Observation loop, deciding whether to retrieve, compute, or finish.
 - You can inspect structured step traces via --show-react-trace for better explainability.
+
+6. Chat Memory
+- SQLite stores ordered user/assistant messages and supplies them to the model as standard chat history.
+- Confirmed preferences are shared across chat sessions with the same user ID and can be viewed, replaced, or deleted.
+- Chat Memory does not depend on embeddings or Chroma; RAG knowledge retrieval remains separate.
 
 ## 2. Models and Tech Stack
 
@@ -76,6 +83,7 @@ Core components:
 - Model client: ChatOpenAI
 - Environment management: python-dotenv
 - ReAct orchestrator: AgentRouter (unified multi-step reasoning and tool orchestration at the Agent layer)
+- Chat Memory: SQLite (ordered session messages and user preference profiles)
 
 Key .env variables:
 
@@ -84,15 +92,20 @@ Key .env variables:
 - OPENAI_BASE_URL=https://api.deepseek.com/v1
 - OPENAI_API_KEY=... (or DEEPSEEK_API_KEY=...)
 - HF_ENDPOINT=https://hf-mirror.com
+- HF_HUB_ETAG_TIMEOUT=60
+- HF_HUB_DOWNLOAD_TIMEOUT=120
 - ENABLE_OCR=true
 - OCR_DPI=200
 - MIN_PAGE_CHARS=20
 - ENABLE_REACT=true (enable ReAct retrieval-reasoning loop)
 - REACT_MAX_STEPS=3 (maximum ReAct iterations)
+- MEMORY_DIR=./data/memory (SQLite chat memory directory)
+- MEMORY_PROFILE_MIN_CONFIDENCE=0.7 (minimum confirmed profile confidence)
+- CHAT_HISTORY_LIMIT=20 (recent messages loaded for each chat turn)
 
 ## 3. Architecture
 
-The system follows a four-layer design:
+The system follows a five-layer design:
 
 1. Data layer
 - Local report corpus: Knowledge/industry_bank, Knowledge/stock_bank, Knowledge/macro_policy
@@ -111,6 +124,11 @@ The system follows a four-layer design:
 - Unified action execution: rag_retrieve (retrieve) / mcp_call (compute) / finish (stop)
 - Auto-routing into RAG, MCP, or hybrid reasoning, with structured answers and sources
 
+5. Chat Memory layer
+- SQLite session messages scoped by session ID
+- User preference profiles shared across chat sessions with the same user ID
+- Independent from the RAG vector store
+
 ## 4. Run Guide
 
 ### 4.1 Install dependencies
@@ -128,6 +146,8 @@ Copy-Item .env.example .env
 ```
 
 At minimum, configure EMBEDDING_MODEL, OPENAI_MODEL, OPENAI_BASE_URL, and OPENAI_API_KEY (or DEEPSEEK_API_KEY).
+
+The current `.env.example` can be copied directly. Legacy scope/project memory variables may be omitted; their code defaults do not control Chat Memory.
 
 ### 4.3 Build index
 
@@ -155,6 +175,7 @@ python -m src.main ask --question "How did net interest margins trend for banks 
 ```powershell
 python -m src.main chat
 python -m src.main chat --show-react-trace
+python -m src.main chat --user-id u001 --session-id s001
 ```
 
 3. MCP tools
@@ -174,7 +195,7 @@ python -m src.main agent-ask -q "What is provision coverage ratio for banks?"
 python -m src.main agent-ask -q "What is provision coverage ratio for banks?" --show-react-trace
 ```
 
-Note: `ask / chat / agent-ask` now use the same full-feature orchestration path (auto-routing across RAG/MCP/hybrid) with ReAct enabled.
+Note: `ask / chat / agent-ask` use the same orchestration path with ReAct enabled. Only `chat` persists conversation history; `ask / agent-ask` remain stateless.
 `--show-react-trace` is optional. By default, fine-grained ReAct trace is hidden and only answer + route + sources are shown. Enabling this flag prints structured step-by-step traces with `Thought / Action / Observation`.
 
 5. Regression tests
@@ -182,13 +203,92 @@ Note: `ask / chat / agent-ask` now use the same full-feature orchestration path 
 ```powershell
 python scripts/test_mcp_tools.py
 python scripts/test_agent_router.py
+python scripts/test_memory_store.py
 ```
 
-### 4.5 Example outputs (real run excerpts)
+### 4.5 Chat Memory
+
+Chat Memory is enabled only for `chat` and has two parts:
+
+- **Short-term memory**: ordered user/assistant messages scoped by `session-id`.
+- **Long-term preferences**: explicit, high-confidence preferences scoped by `user-id` and reusable across sessions.
+
+`ask / agent-ask` remain stateless.
+
+1. Configure and run
+
+```powershell
+# .env
+MEMORY_DIR=./data/memory
+MEMORY_PROFILE_MIN_CONFIDENCE=0.7
+CHAT_HISTORY_LIMIT=20
+
+# Start or restore a stateful chat
+python -m src.main chat --user-id u001 --session-id s001
+```
+
+2. Manage preferences
+
+```powershell
+python -m src.main profile-show --user-id u001
+python -m src.main profile-set --user-id u001 --preference output_style=bullet-points --preference risk_preference=conservative
+python -m src.main profile-delete --user-id u001
+```
+
+3. How it works
+
+Chat Memory is stored in `MEMORY_DIR/chat_memory.sqlite3`. `chat_sessions` stores sessions, `chat_messages` stores ordered messages, and `user_profiles` stores preferences. Each turn:
+
+1. Loads recent messages for the current session and the user profile from SQLite.
+2. Persists the current user message, then supplies history to Agent/ReAct as standard chat messages.
+3. Persists the assistant message after a successful answer; the next turn or restored session reloads from SQLite.
+
+Messages are persisted per turn, not batched when chat exits. `CHAT_HISTORY_LIMIT=20` loads at most 20 messages, usually about 10 complete turns. Older messages remain in SQLite but are excluded from the current prompt.
+
+4. Current limitations
+
+- **Automatic Summary is not implemented yet**: `chat_sessions.summary` is only a reserved field. Messages outside the 20-message window are not summarized, so the model sees only the most recent 20 messages.
+- Reading chat history uses only SQLite. Embeddings and Chroma are loaded only when the agent actually executes `rag_retrieve`.
+- Preferences are stored and injected, but final formatting still depends on LLM instruction following.
+
+### 4.6 Example outputs (real run excerpts)
 
 The following excerpts are captured from real local runs for quick verification.
 
-1. ask command (full-feature orchestration, auto-routes to MCP)
+1. Session short-term memory
+
+```powershell
+python -m src.main chat --user-id readme-memory-test --session-id readme-memory-20260805
+```
+
+The first turn loaded 0 messages. The second turn loaded 2 messages and reused the previous `8.25 / 0.68 = 12.13x` example. After exiting and reopening the same session, the model loaded 10 messages and correctly identified the first question:
+
+```text
+=== Answer ===
+Your first question in this session was: "CITIC Bank price is 8.25 and EPS is 0.68, calculate static PE."
+
+=== Chat Memory ===
+- Loaded messages: 10
+- User profile loaded: No
+- Message write: ok
+```
+
+This uses general chat history; there is no special "previous question" handler.
+
+2. Cross-session user preferences
+
+An explicit preference produced `profile write: updated`. A new session with the same user ID then showed:
+
+```text
+=== Chat Memory ===
+- Loaded messages: 0
+- User profile loaded: Yes
+- Message write: ok
+```
+
+The preference for parenthetical explanations appeared in the answer. Bullet-point formatting was not consistent, confirming that preference injection is not the same as enforced formatting.
+
+3. ask command (full-feature orchestration, auto-routes to MCP)
 
 Command:
 
@@ -210,7 +310,7 @@ Static PE of CITIC Bank = Price ÷ EPS = 8.25 ÷ 0.68 ≈ 12.13x.
 - Agent-level ReAct is enabled (Thought -> Action -> Observation).
 ```
 
-2. ask command (show structured ReAct trace)
+4. ask command (show structured ReAct trace)
 
 Command:
 
@@ -238,7 +338,7 @@ Observation:
   Loop ended and final answer returned.
 ```
 
-3. agent-ask command (hybrid RAG + MCP)
+5. agent-ask command (hybrid RAG + MCP)
 
 Command:
 
@@ -350,32 +450,13 @@ Chroma local persistence is suitable for demos and small-to-medium datasets. As 
 
 ### 6.4 Memory mechanism evolution
 
-To improve continuity and personalization, a layered Memory mechanism is recommended, enabling cross-turn memory, cross-session reuse, and controlled forgetting.
+The current Chat Memory implementation provides SQLite session messages and cross-session user preferences. The RAG knowledge base remains separate and is not conversation memory.
 
-1. Memory layer design
-- Session Memory: stores current-session context, temporary user goals, and task state.
-- User Memory: stores long-term user preferences (language, response style, preferred metrics).
-- Project Memory: stores project-level facts such as metric definitions, folder conventions, and tool mappings.
+Planned work:
 
-2. Recommended memory content
-- User preferences: preferred response length, chart preference, and whether to present conclusions first.
-- Business facts: sector labels, metric definitions, and unit conversion rules.
-- Execution traces: common failure patterns, fixes, and successful invocation templates.
-
-3. Typical execution flow
-- Step 1: retrieve relevant memory before routing, then enrich the current context.
-- Step 2: run intent classification and RAG/MCP orchestration.
-- Step 3: write validated new information back into memory with deduplication, categorization, and tagging.
-
-4. Governance and safety
-- Apply TTL or versioning to periodically clean outdated memory and prevent stale-fact contamination.
-- Add source validation for high-risk fields (financial conclusions and time-sensitive data).
-- Keep memory user-visible, editable, and deletable for controllability and compliance.
-
-5. Expected benefits
-- Fewer repeated clarifications and higher multi-turn efficiency.
-- Better consistency and personalization in outputs.
-- Continuous improvement of the RAG retrieval, MCP calculation, and Agent orchestration loop over long-term usage.
+1. **Session Summary**: incrementally summarize messages outside the recent window and build prompts from summary + recent raw messages.
+2. **Token budget**: replace the fixed message count with model-aware context-window trimming.
+3. **Preference governance**: add field-level sources, version history, and stronger formatting controls.
 
 ## 7. How to Build Your Own Knowledge Base (Not Limited to Banking)
 

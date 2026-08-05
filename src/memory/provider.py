@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import Any
 
-from src.memory.models import MemoryRecord, MemoryScope
+from src.memory.models import ChatMessage, ChatSession, MemoryRecord, MemoryScope, UserPreferenceProfile
 
 
 class MemoryProvider(ABC):
@@ -60,4 +60,46 @@ class MemoryProvider(ABC):
         user_id: str = "",
         session_id: str = "",
     ) -> int:
+        raise NotImplementedError
+
+
+class ChatMemoryProvider(ABC):
+    # 这个抽象类用于定义聊天消息与用户偏好的持久化接口。
+
+    @abstractmethod
+    def ensure_session(self, *, session_id: str, user_id: str = "") -> ChatSession:
+        raise NotImplementedError
+
+    @abstractmethod
+    def append_message(
+        self,
+        *,
+        session_id: str,
+        role: str,
+        content: str,
+        user_id: str = "",
+        payload: dict[str, Any] | None = None,
+    ) -> ChatMessage:
+        raise NotImplementedError
+
+    @abstractmethod
+    def list_messages(self, *, session_id: str, limit: int) -> list[ChatMessage]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_profile(self, *, user_id: str) -> UserPreferenceProfile | None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def upsert_profile(
+        self,
+        *,
+        user_id: str,
+        preferences: dict[str, Any],
+        confidence: float,
+    ) -> UserPreferenceProfile:
+        raise NotImplementedError
+
+    @abstractmethod
+    def delete_profile(self, *, user_id: str) -> bool:
         raise NotImplementedError

@@ -9,7 +9,7 @@ import typer
 
 from src.agent import AgentRouter
 from src.config import load_settings
-from src.memory import HybridMemoryStore, MemoryScope
+from src.memory import ChatMemoryStore, HybridMemoryStore, MemoryScope
 from src.mcp import MCPDispatcher
 from src.mcp.nl_router import build_request_from_question
 from src.rag.build_index import build_vector_index
@@ -68,6 +68,15 @@ def _render_route_output(output, show_react_trace: bool) -> None:
         for source in output.sources:
             typer.echo(f"- {source}")
 
+    chat_memory = output.data.get("chat_memory", {}) if isinstance(output.data, dict) else {}
+    if isinstance(chat_memory, dict) and chat_memory:
+        # 这个代码块用于展示聊天记忆状态，同时避免输出实际对话与偏好内容。
+        typer.echo("\n=== Chat Memory ===")
+        typer.echo(f"- 已载入消息: {chat_memory.get('loaded_messages', 0)}")
+        typer.echo(f"- 已载入用户偏好: {'是' if chat_memory.get('profile_loaded') else '否'}")
+        typer.echo(f"- 消息写入: {chat_memory.get('write_status', 'unknown')}")
+        typer.echo(f"- 偏好写入: {chat_memory.get('profile_write_status', 'unknown')}")
+
 
 def _to_memory_scope(scope: str) -> MemoryScope:
     # 这个函数用于把命令行scope参数转换为枚举值。
@@ -104,8 +113,6 @@ def build_index_cmd(
 @app.command("ask")
 def ask_cmd(
     question: str = typer.Option(..., "--question", "-q", help="提问内容"),
-    user_id: str = typer.Option("", "--user-id", help="用户身份ID（用于用户记忆）"),
-    session_id: str = typer.Option("", "--session-id", help="会话ID（用于短期记忆）"),
     show_react_trace: bool = typer.Option(False, "--show-react-trace", help="是否显示ReAct轨迹"),
 ) -> None:
     # 这个命令用于执行单次全功能调度问答（Agent+ReAct）。
@@ -114,7 +121,7 @@ def ask_cmd(
         raise typer.BadParameter("未检测到向量索引，请先执行 build-index。")
 
     router = AgentRouter(settings)
-    output = router.ask(question, user_id=user_id, session_id=session_id)
+    output = router.ask(question)
     _render_route_output(output, show_react_trace)
 
 
@@ -139,7 +146,7 @@ def chat_cmd(
             typer.echo("已退出。")
             break
 
-        output = router.ask(question, user_id=user_id, session_id=active_session_id)
+        output = router.chat(question, user_id=user_id, session_id=active_session_id)
         typer.echo("\n助手:")
         _render_route_output(output, show_react_trace)
 
@@ -217,14 +224,12 @@ def agent_route_cmd(question: str = typer.Option(..., "--question", "-q", help="
 @app.command("agent-ask")
 def agent_ask_cmd(
     question: str = typer.Option(..., "--question", "-q", help="提问内容"),
-    user_id: str = typer.Option("", "--user-id", help="用户身份ID（用于用户记忆）"),
-    session_id: str = typer.Option("", "--session-id", help="会话ID（用于短期记忆）"),
     show_react_trace: bool = typer.Option(False, "--show-react-trace", help="是否显示ReAct轨迹"),
 ) -> None:
     # 这个命令用于执行阶段四完整调度链路。
     settings = load_settings()
     router = AgentRouter(settings)
-    output = router.ask(question, user_id=user_id, session_id=session_id)
+    output = router.ask(question)
     _render_route_output(output, show_react_trace)
 
 
@@ -361,6 +366,76 @@ def memory_clear_cmd(
     memory_scope = _to_memory_scope(scope) if scope.strip() else None
     removed = store.clear(scope=memory_scope, user_id=user_id, session_id=session_id)
     typer.echo(json.dumps({"ok": True, "removed": removed}, ensure_ascii=False, indent=2))
+
+
+@app.command("profile-show")
+def profile_show_cmd(user_id: str = typer.Option(..., "--user-id", help="用户身份ID")) -> None:
+    # 这个命令用于查看指定用户当前生效的长期偏好。
+    settings = load_settings()
+    store = ChatMemoryStore(settings.memory_dir)
+    try:
+        profile = store.get_profile(user_id=user_id)
+        payload = None
+        if profile is not None:
+            payload = {
+                "user_id": profile.user_id,
+                "preferences": profile.preferences,
+                "confidence": profile.confidence,
+                "updated_at": profile.updated_at.isoformat(),
+            }
+        typer.echo(json.dumps({"ok": True, "profile": payload}, ensure_ascii=False, indent=2))
+    finally:
+        store.close()
+
+
+@app.command("profile-set")
+def profile_set_cmd(
+    user_id: str = typer.Option(..., "--user-id", help="用户身份ID"),
+    preference: list[str] = typer.Option(..., "--preference", help="可重复的偏好字段，格式key=value"),
+    confidence: float = typer.Option(1.0, "--confidence", help="置信度[0,1]"),
+) -> None:
+    # 这个命令用于手动创建或覆盖指定用户的长期偏好。
+    parsed: dict[str, str] = {}
+    for item in preference:
+        key, separator, value = item.partition("=")
+        if not separator or not key.strip() or not value.strip():
+            raise typer.BadParameter("preference必须使用非空的key=value格式。")
+        parsed[key.strip()] = value.strip()
+
+    settings = load_settings()
+    store = ChatMemoryStore(settings.memory_dir)
+    try:
+        profile = store.upsert_profile(
+            user_id=user_id,
+            preferences=parsed,
+            confidence=confidence,
+        )
+        typer.echo(
+            json.dumps(
+                {
+                    "ok": True,
+                    "user_id": profile.user_id,
+                    "preferences": profile.preferences,
+                    "confidence": profile.confidence,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    finally:
+        store.close()
+
+
+@app.command("profile-delete")
+def profile_delete_cmd(user_id: str = typer.Option(..., "--user-id", help="用户身份ID")) -> None:
+    # 这个命令用于删除指定用户的全部长期偏好。
+    settings = load_settings()
+    store = ChatMemoryStore(settings.memory_dir)
+    try:
+        removed = store.delete_profile(user_id=user_id)
+        typer.echo(json.dumps({"ok": True, "removed": removed}, ensure_ascii=False, indent=2))
+    finally:
+        store.close()
 
 
 if __name__ == "__main__":

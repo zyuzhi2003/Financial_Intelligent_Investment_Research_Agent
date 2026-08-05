@@ -63,3 +63,36 @@ class MemoryTrace:
     write_status: str
     # 这个字段用于记录命中的作用域分布。
     scope_counts: dict[str, int]
+
+
+@dataclass(frozen=True)
+class ChatSession:
+    # 这个结构用于描述可恢复的聊天会话。
+    session_id: str
+    user_id: str
+    summary: str
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True)
+class ChatMessage:
+    # 这个结构用于保存一条有序的聊天消息。
+    message_id: str
+    session_id: str
+    user_id: str
+    sequence_no: int
+    role: str
+    content: str
+    payload: dict[str, Any]
+    created_at: datetime
+
+
+@dataclass(frozen=True)
+class UserPreferenceProfile:
+    # 这个结构用于保存跨聊天会话生效的用户偏好。
+    user_id: str
+    preferences: dict[str, Any]
+    confidence: float
+    created_at: datetime
+    updated_at: datetime

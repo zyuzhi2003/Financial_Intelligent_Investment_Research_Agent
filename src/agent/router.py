@@ -8,12 +8,12 @@ import re
 from typing import Any
 
 from langchain_core.documents import Document
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
 from src.agent.intent import IntentResult, RouteType, classify_intent
 from src.config import Settings
-from src.memory import HybridMemoryStore, MemoryScope
+from src.memory import ChatMemoryStore, HybridMemoryStore, MemoryScope
 from src.mcp import MCPDispatcher
 from src.mcp.nl_router import build_request_from_question
 from src.rag.qa_chain import ask_with_rag
@@ -76,8 +76,15 @@ class AgentRouter:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._mcp = MCPDispatcher()
-        self._memory = self._build_memory_store()
+        self._memory: HybridMemoryStore | None = None
+        self._chat_memory: ChatMemoryStore | None = None
         self._profile_candidate_min_confidence = 0.45
+
+    def _get_chat_memory(self) -> ChatMemoryStore:
+        # 这个函数用于仅在chat实际调用时惰性创建SQLite聊天存储。
+        if self._chat_memory is None:
+            self._chat_memory = ChatMemoryStore(self._settings.memory_dir)
+        return self._chat_memory
 
     def _build_memory_store(self) -> HybridMemoryStore | None:
         # 这个函数用于按配置创建记忆存储实例。
@@ -93,38 +100,84 @@ class AgentRouter:
         return classify_intent(question, self._settings)
 
     def ask(self, question: str, *, user_id: str = "", session_id: str = "") -> RouteOutput:
-        # 这个方法用于执行四类场景自动分流。
+        # 这个方法用于执行无状态的单轮自动分流，兼容参数不会启用聊天记忆。
+        _ = (user_id, session_id)
         intent = classify_intent(question, self._settings)
         intent = self._stabilize_intent(question, intent)
-        memory_context, memory_stats = self._load_memory_context(
-            question=question,
-            user_id=user_id,
-            session_id=session_id,
-        )
 
-        output: RouteOutput
         if self._settings.enable_react:
             # 这个分支用于优先启用Agent级ReAct编排；失败时回退原有路径。
             try:
-                output = self._handle_agent_level_react(question, intent, memory_context=memory_context)
-                return self._finalize_with_memory(
-                    question=question,
-                    output=output,
-                    user_id=user_id,
-                    session_id=session_id,
-                    memory_stats=memory_stats,
-                )
+                return self._handle_agent_level_react(question, intent)
             except Exception:  # noqa: BLE001
                 pass
 
-        output = self._dispatch_legacy(question, intent, memory_context=memory_context)
-        return self._finalize_with_memory(
-            question=question,
-            output=output,
-            user_id=user_id,
-            session_id=session_id,
-            memory_stats=memory_stats,
+        return self._dispatch_legacy(question, intent)
+
+    def chat(self, question: str, *, user_id: str, session_id: str) -> RouteOutput:
+        # 这个方法用于加载标准消息历史并执行有状态聊天问答。
+        chat_memory = self._get_chat_memory()
+        session = chat_memory.ensure_session(session_id=session_id, user_id=user_id)
+        stored_messages = chat_memory.list_messages(
+            session_id=session.session_id,
+            limit=self._settings.chat_history_limit,
         )
+        conversation_messages: list[BaseMessage] = []
+        profile = chat_memory.get_profile(user_id=user_id)
+        if profile is not None:
+            conversation_messages.append(
+                SystemMessage(content=f"用户长期偏好：{json.dumps(profile.preferences, ensure_ascii=False)}")
+            )
+        for message in stored_messages:
+            if message.role == "user":
+                conversation_messages.append(HumanMessage(content=message.content))
+            elif message.role == "assistant":
+                conversation_messages.append(AIMessage(content=message.content))
+
+        chat_memory.append_message(
+            session_id=session.session_id,
+            user_id=user_id,
+            role="user",
+            content=question,
+        )
+        intent = self._stabilize_intent(question, classify_intent(question, self._settings))
+        if self._settings.enable_react:
+            try:
+                output = self._handle_agent_level_react(
+                    question,
+                    intent,
+                    conversation_messages=conversation_messages,
+                )
+            except Exception:  # noqa: BLE001
+                output = self._dispatch_legacy(
+                    question,
+                    intent,
+                    conversation_messages=conversation_messages,
+                )
+        else:
+            output = self._dispatch_legacy(
+                question,
+                intent,
+                conversation_messages=conversation_messages,
+            )
+
+        chat_memory.append_message(
+            session_id=session.session_id,
+            user_id=user_id,
+            role="assistant",
+            content=output.answer,
+            payload={"route": output.route.value, "sources": output.sources},
+        )
+        profile_status = self._update_chat_profile(question=question, answer=output.answer, user_id=user_id)
+        data = dict(output.data)
+        data["chat_memory"] = {
+            "session_id": session.session_id,
+            "loaded_messages": len(stored_messages),
+            "profile_loaded": profile is not None,
+            "profile_write_status": profile_status,
+            "write_status": "ok",
+        }
+        return RouteOutput(output.route, output.answer, output.trace, output.sources, data)
 
     @staticmethod
     def _contains_any(text: str, keywords: list[str]) -> bool:
@@ -161,18 +214,24 @@ class AgentRouter:
             reason=f"{intent.reason} | 路由稳定化修正：{reason}",
         )
 
-    def _dispatch_legacy(self, question: str, intent: IntentResult, *, memory_context: str = "") -> RouteOutput:
+    def _dispatch_legacy(
+        self,
+        question: str,
+        intent: IntentResult,
+        *,
+        conversation_messages: list[BaseMessage] | None = None,
+    ) -> RouteOutput:
         # 这个方法用于保留原有稳定路由逻辑作为兜底。
         if intent.route == RouteType.MCP_ONLY:
             return self._handle_mcp_only(question, intent)
 
         if intent.route == RouteType.RAG_ONLY:
-            return self._handle_rag_only(question, intent, memory_context=memory_context)
+            return self._handle_rag_only(question, intent, conversation_messages=conversation_messages)
 
         if intent.route == RouteType.RAG_MCP:
-            return self._handle_rag_mcp(question, intent, memory_context=memory_context)
+            return self._handle_rag_mcp(question, intent, conversation_messages=conversation_messages)
 
-        return self._handle_general(question, intent, memory_context=memory_context)
+        return self._handle_general(question, intent, conversation_messages=conversation_messages)
 
     @staticmethod
     def _extract_json(text: str) -> dict[str, Any]:
@@ -549,7 +608,7 @@ class AgentRouter:
         question: str,
         docs: list[Document],
         mcp_records: list[dict[str, Any]],
-        memory_context: str = "",
+        conversation_messages: list[BaseMessage] | None = None,
     ) -> str:
         # 这个函数用于在ReAct未直接给出final_answer时综合生成最终答案。
         if not self._settings.openai_api_key:
@@ -572,18 +631,18 @@ class AgentRouter:
         )
         context = format_context(docs) if docs else "无检索片段"
         mcp_text = json.dumps(mcp_records, ensure_ascii=False, indent=2) if mcp_records else "无MCP结果"
-        messages = [
-            SystemMessage(content=AGENT_REACT_SYNTHESIS_PROMPT),
+        messages: list[BaseMessage] = [SystemMessage(content=AGENT_REACT_SYNTHESIS_PROMPT)]
+        messages.extend(conversation_messages or [])
+        messages.append(
             HumanMessage(
                 content=(
                     f"用户问题:\n{question}\n\n"
-                    f"记忆上下文:\n{(memory_context or '无')}\n\n"
                     f"RAG片段:\n{context}\n\n"
                     f"MCP结果:\n{mcp_text}\n\n"
                     "请输出最终回答。"
                 )
-            ),
-        ]
+            )
+        )
         result = llm.invoke(messages)
         return str(result.content)
 
@@ -592,11 +651,11 @@ class AgentRouter:
         question: str,
         intent: IntentResult,
         *,
-        memory_context: str = "",
+        conversation_messages: list[BaseMessage] | None = None,
     ) -> RouteOutput:
         # 这个方法用于在Agent层统一执行Thought->Action->Observation循环。
         if not self._settings.openai_api_key:
-            return self._dispatch_legacy(question, intent, memory_context=memory_context)
+            return self._dispatch_legacy(question, intent, conversation_messages=conversation_messages)
 
         llm = ChatOpenAI(
             model=self._settings.openai_model,
@@ -604,7 +663,7 @@ class AgentRouter:
             api_key=self._settings.openai_api_key,
             base_url=self._settings.openai_base_url,
         )
-        retriever = get_retriever(self._settings)
+        retriever = None
 
         rag_pool: list[Document] = []
         mcp_records: list[dict[str, Any]] = []
@@ -617,18 +676,18 @@ class AgentRouter:
         answer: str | None = None
 
         for step in range(1, self._settings.react_max_steps + 1):
-            planner_messages = [
-                SystemMessage(content=AGENT_REACT_PLANNER_PROMPT),
+            planner_messages: list[BaseMessage] = [SystemMessage(content=AGENT_REACT_PLANNER_PROMPT)]
+            planner_messages.extend(conversation_messages or [])
+            planner_messages.append(
                 HumanMessage(
                     content=(
                         f"用户问题:\n{question}\n\n"
-                        f"记忆上下文:\n{(memory_context or '无')}\n\n"
                         f"当前路由提示:\n{intent.route.value}\n\n"
                         f"历史观察:\n{chr(10).join(observation_history)}\n\n"
                         "请输出本轮JSON决策。"
                     )
-                ),
-            ]
+                )
+            )
             planner_result = llm.invoke(planner_messages)
             planner_text = str(planner_result.content)
             plan = self._extract_json(planner_text)
@@ -645,7 +704,7 @@ class AgentRouter:
                     question=question,
                     docs=rag_pool,
                     mcp_records=mcp_records,
-                    memory_context=memory_context,
+                    conversation_messages=conversation_messages,
                 )
                 observation = "结束循环并产出最终回答。"
                 trace.append(f"ReAct: Step {step} | Action: finish")
@@ -662,6 +721,9 @@ class AgentRouter:
 
             if action == "rag_retrieve":
                 query = action_input or question
+                if retriever is None:
+                    # 这个分支用于仅在实际检索时加载Embedding与向量库。
+                    retriever = get_retriever(self._settings)
                 step_docs: list[Document] = retriever.invoke(query)
                 self._append_unique_docs(rag_pool, step_docs)
                 observation = self._build_rag_observation(step_docs)
@@ -722,7 +784,7 @@ class AgentRouter:
                 question=question,
                 docs=rag_pool,
                 mcp_records=mcp_records,
-                memory_context=memory_context,
+                conversation_messages=conversation_messages,
             )
             trace.append("ReAct: 未在限制步数内finish，已自动合成最终答案。")
 
@@ -760,10 +822,10 @@ class AgentRouter:
         question: str,
         intent: IntentResult,
         *,
-        memory_context: str = "",
+        conversation_messages: list[BaseMessage] | None = None,
     ) -> RouteOutput:
         # 这个方法用于执行纯RAG检索问答路径。
-        rag_result = ask_with_rag(self._settings, self._with_memory_context(question, memory_context))
+        rag_result = ask_with_rag(self._settings, question, conversation_history=conversation_messages)
         trace = [intent.reason]
         react_trace = rag_result.get("react_trace", [])
         if isinstance(react_trace, list):
@@ -781,10 +843,10 @@ class AgentRouter:
         question: str,
         intent: IntentResult,
         *,
-        memory_context: str = "",
+        conversation_messages: list[BaseMessage] | None = None,
     ) -> RouteOutput:
         # 这个方法用于执行先RAG后MCP的联合推理路径。
-        rag_result = ask_with_rag(self._settings, self._with_memory_context(question, memory_context))
+        rag_result = ask_with_rag(self._settings, question, conversation_history=conversation_messages)
         mcp_request = build_request_from_question(question, self._settings)
         mcp_response = self._mcp.handle(mcp_request)
 
@@ -849,11 +911,10 @@ class AgentRouter:
         question: str,
         intent: IntentResult,
         *,
-        memory_context: str = "",
+        conversation_messages: list[BaseMessage] | None = None,
     ) -> RouteOutput:
         # 这个方法用于回复无需检索与计算的基础常识问题。
-        _ = memory_context
-        answer = self._general_answer(question)
+        answer = self._general_answer(question, conversation_messages=conversation_messages)
         return RouteOutput(intent.route, answer, [intent.reason], [], {})
 
     @staticmethod
@@ -945,12 +1006,56 @@ class AgentRouter:
 
         return "已完成检索与测算，建议结合行业文本进一步判断。"
 
-    @staticmethod
-    def _general_answer(question: str) -> str:
+    def _general_answer(
+        self,
+        question: str,
+        *,
+        conversation_messages: list[BaseMessage] | None = None,
+    ) -> str:
         # 这个函数用于提供轻量常识兜底回复。
+        if conversation_messages and self._settings.openai_api_key:
+            llm = ChatOpenAI(
+                model=self._settings.openai_model,
+                temperature=0,
+                api_key=self._settings.openai_api_key,
+                base_url=self._settings.openai_base_url,
+            )
+            messages: list[BaseMessage] = [
+                SystemMessage(content="你是金融投研助手。请结合当前聊天历史准确回答，不要编造对话内容。")
+            ]
+            messages.extend(conversation_messages)
+            messages.append(HumanMessage(content=question))
+            return str(llm.invoke(messages).content)
+
         if "拨备覆盖率" in question:
             return (
                 "拨备覆盖率是银行贷款损失准备与不良贷款余额的比值，"
                 "通常用于衡量风险缓冲能力，数值越高一般代表抗风险能力越强。"
             )
         return "该问题更适合基础金融常识解释，请补充更具体的指标或场景以便深入分析。"
+
+    def _update_chat_profile(self, *, question: str, answer: str, user_id: str) -> str:
+        # 这个函数用于仅在用户明确表达偏好时更新跨会话画像。
+        if not user_id.strip():
+            return "skip:no_user"
+        preference_markers = ["我偏好", "我喜欢", "以后请", "后续请", "请记住", "回答风格", "风险偏好", "投资期限"]
+        if not any(marker in question for marker in preference_markers):
+            return "skip:not_explicit"
+        try:
+            candidate = self._extract_user_profile_payload(question=question, answer=answer)
+            if candidate is None:
+                return "skip:no_payload"
+            confidence = float(candidate.get("confidence", 0.0))
+            if confidence < self._settings.memory_profile_min_confidence:
+                return "skip:low_confidence"
+            chat_memory = self._get_chat_memory()
+            existing = chat_memory.get_profile(user_id=user_id)
+            merged = self._merge_profile_payload(existing.preferences if existing else {}, candidate)
+            chat_memory.upsert_profile(
+                user_id=user_id,
+                preferences=merged,
+                confidence=confidence,
+            )
+            return "updated"
+        except Exception as exc:  # noqa: BLE001
+            return f"failed:{exc}"

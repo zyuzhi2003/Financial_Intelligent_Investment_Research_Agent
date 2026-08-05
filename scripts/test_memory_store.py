@@ -13,7 +13,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.config import Settings
-from src.memory import HybridMemoryStore, MemoryScope
+from src.memory import ChatMemoryStore, HybridMemoryStore, MemoryScope
 
 
 def _assert_true(condition: bool, message: str) -> None:
@@ -56,6 +56,36 @@ def main() -> int:
     try:
         settings = _build_settings(temp_dir)
         store = HybridMemoryStore(settings)
+
+        # 这个代码块用于验证聊天消息无需向量模型即可按会话顺序持久化。
+        chat_store = ChatMemoryStore(temp_dir)
+        chat_store.ensure_session(session_id="chat-1", user_id="u1")
+        chat_store.append_message(session_id="chat-1", user_id="u1", role="user", content="第一个问题")
+        chat_store.append_message(session_id="chat-1", user_id="u1", role="assistant", content="第一个回答")
+        chat_store.append_message(session_id="chat-1", user_id="u1", role="user", content="第二个问题")
+        messages = chat_store.list_messages(session_id="chat-1", limit=10)
+        _assert_true([item.content for item in messages] == ["第一个问题", "第一个回答", "第二个问题"], "聊天消息顺序异常")
+        _assert_true(chat_store.list_messages(session_id="chat-2", limit=10) == [], "不同session不应共享消息")
+
+        anonymous_session = chat_store.ensure_session(session_id="chat-anonymous")
+        _assert_true(anonymous_session.user_id == "", "匿名session初始不应绑定用户")
+        claimed_session = chat_store.ensure_session(session_id="chat-anonymous", user_id="u1")
+        _assert_true(claimed_session.user_id == "u1", "首次提供身份时应认领匿名session")
+        try:
+            chat_store.ensure_session(session_id="chat-anonymous", user_id="u2")
+            raise AssertionError("其他用户不应恢复已归属的session")
+        except ValueError:
+            pass
+
+        profile = chat_store.upsert_profile(
+            user_id="u1",
+            preferences={"output_style": "要点式"},
+            confidence=0.9,
+        )
+        _assert_true(profile.preferences["output_style"] == "要点式", "用户偏好写入失败")
+        _assert_true(chat_store.delete_profile(user_id="u1"), "用户偏好删除失败")
+        _assert_true(chat_store.get_profile(user_id="u1") is None, "用户偏好删除后仍可读取")
+        chat_store.close()
 
         expire_at = store.default_expiration()
         session_item_id = store.put(

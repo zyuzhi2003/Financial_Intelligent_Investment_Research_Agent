@@ -10,8 +10,8 @@ import uuid
 from langchain_chroma import Chroma
 
 from src.config import Settings
-from src.memory.models import MemoryRecord, MemoryScope
-from src.memory.provider import MemoryProvider
+from src.memory.models import ChatMessage, ChatSession, MemoryRecord, MemoryScope, UserPreferenceProfile
+from src.memory.provider import ChatMemoryProvider, MemoryProvider
 from src.rag.embeddings import create_embeddings
 
 
@@ -30,6 +30,257 @@ class SqlWhere:
     # 这个结构用于组织SQL过滤条件与参数。
     clause: str
     params: tuple[object, ...]
+
+
+class ChatMemoryStore(ChatMemoryProvider):
+    # 这个类用于通过SQLite持久化有序聊天消息和用户偏好，不依赖向量模型。
+    def __init__(self, memory_dir: Path) -> None:
+        memory_dir.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(str(memory_dir / "chat_memory.sqlite3"))
+        self._conn.row_factory = sqlite3.Row
+        self._ensure_schema()
+
+    def _ensure_schema(self) -> None:
+        # 这个函数用于无破坏地初始化聊天记忆表和索引。
+        self._conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS chat_sessions (
+                session_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                message_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                user_id TEXT NOT NULL DEFAULT '',
+                sequence_no INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                UNIQUE(session_id, sequence_no),
+                FOREIGN KEY(session_id) REFERENCES chat_sessions(session_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_chat_messages_session_sequence
+                ON chat_messages(session_id, sequence_no DESC);
+
+            CREATE TABLE IF NOT EXISTS user_profiles (
+                user_id TEXT PRIMARY KEY,
+                preferences_json TEXT NOT NULL DEFAULT '{}',
+                confidence REAL NOT NULL DEFAULT 0.0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            """
+        )
+        self._conn.commit()
+
+    @staticmethod
+    def _row_to_session(row: sqlite3.Row) -> ChatSession:
+        # 这个函数用于把数据库行转换为聊天会话模型。
+        return ChatSession(
+            session_id=str(row["session_id"]),
+            user_id=str(row["user_id"]),
+            summary=str(row["summary"]),
+            created_at=datetime.fromisoformat(str(row["created_at"])),
+            updated_at=datetime.fromisoformat(str(row["updated_at"])),
+        )
+
+    @staticmethod
+    def _row_to_message(row: sqlite3.Row) -> ChatMessage:
+        # 这个函数用于把数据库行转换为聊天消息模型。
+        return ChatMessage(
+            message_id=str(row["message_id"]),
+            session_id=str(row["session_id"]),
+            user_id=str(row["user_id"]),
+            sequence_no=int(row["sequence_no"]),
+            role=str(row["role"]),
+            content=str(row["content"]),
+            payload=dict(json.loads(str(row["payload_json"]))),
+            created_at=datetime.fromisoformat(str(row["created_at"])),
+        )
+
+    @staticmethod
+    def _row_to_profile(row: sqlite3.Row) -> UserPreferenceProfile:
+        # 这个函数用于把数据库行转换为用户偏好模型。
+        return UserPreferenceProfile(
+            user_id=str(row["user_id"]),
+            preferences=dict(json.loads(str(row["preferences_json"]))),
+            confidence=float(row["confidence"]),
+            created_at=datetime.fromisoformat(str(row["created_at"])),
+            updated_at=datetime.fromisoformat(str(row["updated_at"])),
+        )
+
+    def ensure_session(self, *, session_id: str, user_id: str = "") -> ChatSession:
+        # 这个方法用于创建会话或验证已有会话的用户归属。
+        normalized_session = session_id.strip()
+        normalized_user = user_id.strip()
+        if not normalized_session:
+            raise ValueError("session_id不能为空。")
+
+        row = self._conn.execute(
+            "SELECT * FROM chat_sessions WHERE session_id = ?",
+            (normalized_session,),
+        ).fetchone()
+        if row is not None:
+            session = self._row_to_session(row)
+            if session.user_id and normalized_user and session.user_id != normalized_user:
+                raise ValueError("session_id已属于其他用户。")
+            if not session.user_id and normalized_user:
+                # 这个分支用于让首次提供身份的用户安全认领匿名会话。
+                now = _utc_now().isoformat()
+                self._conn.execute(
+                    "UPDATE chat_sessions SET user_id = ?, updated_at = ? WHERE session_id = ? AND user_id = ''",
+                    (normalized_user, now, normalized_session),
+                )
+                self._conn.commit()
+                claimed = self._conn.execute(
+                    "SELECT * FROM chat_sessions WHERE session_id = ?",
+                    (normalized_session,),
+                ).fetchone()
+                return self._row_to_session(claimed)
+            return session
+
+        now = _utc_now().isoformat()
+        self._conn.execute(
+            "INSERT INTO chat_sessions(session_id, user_id, summary, created_at, updated_at) VALUES(?, ?, '', ?, ?)",
+            (normalized_session, normalized_user, now, now),
+        )
+        self._conn.commit()
+        created = self._conn.execute(
+            "SELECT * FROM chat_sessions WHERE session_id = ?",
+            (normalized_session,),
+        ).fetchone()
+        return self._row_to_session(created)
+
+    def append_message(
+        self,
+        *,
+        session_id: str,
+        role: str,
+        content: str,
+        user_id: str = "",
+        payload: dict | None = None,
+    ) -> ChatMessage:
+        # 这个方法用于原子追加一条具有稳定顺序号的聊天消息。
+        normalized_role = role.strip().lower()
+        normalized_content = content.strip()
+        if normalized_role not in {"user", "assistant"}:
+            raise ValueError("role仅支持user/assistant。")
+        if not normalized_content:
+            raise ValueError("消息内容不能为空。")
+        session = self.ensure_session(session_id=session_id, user_id=user_id)
+        now = _utc_now().isoformat()
+        message_id = str(uuid.uuid4())
+        with self._conn:
+            row = self._conn.execute(
+                "SELECT COALESCE(MAX(sequence_no), 0) + 1 AS next_no FROM chat_messages WHERE session_id = ?",
+                (session.session_id,),
+            ).fetchone()
+            sequence_no = int(row["next_no"])
+            self._conn.execute(
+                """
+                INSERT INTO chat_messages(
+                    message_id, session_id, user_id, sequence_no, role, content, payload_json, created_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    message_id,
+                    session.session_id,
+                    session.user_id,
+                    sequence_no,
+                    normalized_role,
+                    normalized_content,
+                    json.dumps(payload or {}, ensure_ascii=False),
+                    now,
+                ),
+            )
+            self._conn.execute(
+                "UPDATE chat_sessions SET updated_at = ? WHERE session_id = ?",
+                (now, session.session_id),
+            )
+        created = self._conn.execute(
+            "SELECT * FROM chat_messages WHERE message_id = ?",
+            (message_id,),
+        ).fetchone()
+        return self._row_to_message(created)
+
+    def list_messages(self, *, session_id: str, limit: int) -> list[ChatMessage]:
+        # 这个方法用于读取最近消息并恢复为从旧到新的顺序。
+        rows = self._conn.execute(
+            """
+            SELECT * FROM chat_messages
+            WHERE session_id = ?
+            ORDER BY sequence_no DESC
+            LIMIT ?
+            """,
+            (session_id.strip(), max(1, limit)),
+        ).fetchall()
+        return [self._row_to_message(row) for row in reversed(rows)]
+
+    def get_profile(self, *, user_id: str) -> UserPreferenceProfile | None:
+        # 这个方法用于读取指定用户当前生效的偏好画像。
+        normalized_user = user_id.strip()
+        if not normalized_user:
+            return None
+        row = self._conn.execute(
+            "SELECT * FROM user_profiles WHERE user_id = ?",
+            (normalized_user,),
+        ).fetchone()
+        return self._row_to_profile(row) if row is not None else None
+
+    def upsert_profile(
+        self,
+        *,
+        user_id: str,
+        preferences: dict,
+        confidence: float,
+    ) -> UserPreferenceProfile:
+        # 这个方法用于创建或覆盖指定用户的结构化偏好画像。
+        normalized_user = user_id.strip()
+        if not normalized_user:
+            raise ValueError("user_id不能为空。")
+        now = _utc_now().isoformat()
+        clamped_confidence = max(0.0, min(1.0, float(confidence)))
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO user_profiles(user_id, preferences_json, confidence, created_at, updated_at)
+                VALUES(?, ?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    preferences_json = excluded.preferences_json,
+                    confidence = excluded.confidence,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    normalized_user,
+                    json.dumps(preferences, ensure_ascii=False),
+                    clamped_confidence,
+                    now,
+                    now,
+                ),
+            )
+        profile = self.get_profile(user_id=normalized_user)
+        if profile is None:
+            raise RuntimeError("用户偏好写入失败。")
+        return profile
+
+    def delete_profile(self, *, user_id: str) -> bool:
+        # 这个方法用于删除指定用户的全部长期偏好。
+        cursor = self._conn.execute(
+            "DELETE FROM user_profiles WHERE user_id = ?",
+            (user_id.strip(),),
+        )
+        self._conn.commit()
+        return cursor.rowcount > 0
+
+    def close(self) -> None:
+        # 这个方法用于释放聊天记忆数据库连接。
+        self._conn.close()
 
 
 class HybridMemoryStore(MemoryProvider):

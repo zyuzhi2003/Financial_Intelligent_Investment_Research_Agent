@@ -14,7 +14,7 @@
     - [4.2 配置环境变量](#42-配置环境变量)
     - [4.3 构建索引](#43-构建索引)
     - [4.4 运行方式](#44-运行方式)
-    - [4.5 Memory使用（短期/用户/项目）](#45-memory使用短期用户项目)
+    - [4.5 Chat Memory使用](#45-chat-memory使用)
     - [4.6 运行结果示例（实测输出摘录）](#46-运行结果示例实测输出摘录)
   - [5. 常见报错](#5-常见报错)
   - [6. 未来展望](#6-未来展望)
@@ -57,14 +57,14 @@
 
 5. ReAct动态编排（统一问答入口）
 - `ask / chat / agent-ask` 统一走Agent调度，并在每轮问答中启用ReAct机制。
+- `ask / agent-ask` 是无状态单轮调用；`chat` 在相同session内提供有状态多轮对话。
 - ReAct按 `Thought -> Action -> Observation` 闭环执行，动态决定下一步是检索、计算还是结束回答。
 - 支持通过 `--show-react-trace` 查看结构化步骤轨迹，提升过程可解释性。
 
-6. 分层Memory（已实现）
-- 会话记忆（session）：同一会话内记住上下文。
-- 用户记忆（user）：沉淀用户偏好（风险偏好、投资期限、输出风格等）。
-- 项目记忆（project）：沉淀可复用的项目结论。
-- 支持TTL清理、手动查询/清理、语义检索（SQLite主存 + Chroma语义层）。
+6. Chat Memory（已实现）
+- 会话消息：SQLite按原始顺序保存user/assistant消息，并作为标准消息历史传给模型。
+- 用户画像：同一`user-id`的明确偏好可跨chat session复用，并支持查看、覆盖和删除。
+- Chat Memory不依赖Embedding或Chroma；知识检索仍由RAG向量库独立负责。
 
 ## 2. 模型与技术栈说明
 
@@ -83,7 +83,7 @@
 - 模型接入：`ChatOpenAI`
 - 环境管理：`python-dotenv`
 - ReAct编排器：`AgentRouter`（在Agent层统一执行多步推理与工具调度）
-- Memory存储：`SQLite + Chroma`（SQLite事实主存，Chroma语义召回）
+- Chat Memory存储：`SQLite`（会话消息与用户画像）
 
 关键环境变量（`.env`）：
 
@@ -92,18 +92,16 @@
 - `OPENAI_BASE_URL=https://api.deepseek.com/v1`
 - `OPENAI_API_KEY=...`（或 `DEEPSEEK_API_KEY=...`）
 - `HF_ENDPOINT=https://hf-mirror.com`
+- `HF_HUB_ETAG_TIMEOUT=60`（Hugging Face元数据请求超时秒数）
+- `HF_HUB_DOWNLOAD_TIMEOUT=120`（Hugging Face模型下载超时秒数）
 - `ENABLE_OCR=true`
 - `OCR_DPI=200`
 - `MIN_PAGE_CHARS=20`
 - `ENABLE_REACT=true`（是否启用ReAct检索-推理循环）
 - `REACT_MAX_STEPS=3`（ReAct最多迭代步数）
-- `MEMORY_ENABLED=true`（是否启用Memory）
-- `MEMORY_BACKEND=hybrid`（`sqlite` / `hybrid`）
 - `MEMORY_DIR=./data/memory`
-- `MEMORY_TOP_K=3`
-- `MEMORY_TTL_DAYS=30`
-- `MEMORY_COLLECTION=agent_memory`
 - `MEMORY_PROFILE_MIN_CONFIDENCE=0.7`（用户画像确认阈值）
+- `CHAT_HISTORY_LIMIT=20`（每轮chat载入的最近消息数量）
 
 ## 3. 架构介绍
 
@@ -196,7 +194,7 @@ python -m src.main agent-ask -q "什么是银行拨备覆盖率？"
 python -m src.main agent-ask -q "什么是银行拨备覆盖率？" --show-react-trace
 ```
 
-说明：`ask / chat / agent-ask` 现在统一走全功能调度（自动判断RAG/MCP/联合推理），并启用ReAct机制。
+说明：`ask / chat / agent-ask` 统一走全功能调度（自动判断RAG/MCP/联合推理），并启用ReAct机制。只有`chat`保存对话历史；`ask / agent-ask`保持无状态。
 `--show-react-trace` 为可选开关，默认不展示细粒度轨迹，仅输出答案、执行路径与来源；开启后会按 Step 结构展示 `Thought / Action / Observation`。
 
 5. 回归测试
@@ -207,48 +205,111 @@ python scripts/test_agent_router.py
 python scripts/test_memory_store.py
 ```
 
-### 4.5 Memory使用（短期/用户/项目）
+### 4.5 Chat Memory使用
 
-1. 开启Memory
+Chat Memory只在`chat`命令中生效，分为两部分：
+
+- **短期记忆**：按`session-id`保存有序的user/assistant消息；恢复同一session即可继续对话。
+- **长期偏好**：按`user-id`保存明确表达且达到置信度阈值的偏好，可跨session复用。
+
+`ask / agent-ask`保持无状态，不读取或写入Chat Memory。
+
+1. 配置与使用
 
 ```powershell
 # .env
-MEMORY_ENABLED=true
-MEMORY_BACKEND=hybrid
 MEMORY_DIR=./data/memory
-MEMORY_TOP_K=3
-MEMORY_TTL_DAYS=30
-MEMORY_COLLECTION=agent_memory
 MEMORY_PROFILE_MIN_CONFIDENCE=0.7
+CHAT_HISTORY_LIMIT=20
+
+# 启动或恢复有状态聊天
+python -m src.main chat --user-id u001 --session-id s001
 ```
 
-2. 带身份问答（触发session/user记忆）
+2. 管理长期偏好
 
 ```powershell
-python -m src.main agent-ask -q "我风险偏好保守，投资期限3到5年，请以后要点式回答" --user-id u001 --session-id s001
+python -m src.main profile-show --user-id u001
+python -m src.main profile-set --user-id u001 --preference output_style=要点式 --preference risk_preference=稳健
+python -m src.main profile-delete --user-id u001
 ```
 
-3. 查询记忆
+3. 工作方式
 
-```powershell
-python -m src.main memory-list --scope session --user-id u001 --session-id s001 --limit 5
-python -m src.main memory-list --scope user --user-id u001 --limit 5
-python -m src.main memory-list --scope project --limit 5
-python -m src.main memory-search -q "静态PE" --scope session --user-id u001 --session-id s001 --top-k 3
-```
+Chat Memory保存在`MEMORY_DIR/chat_memory.sqlite3`：`chat_sessions`记录会话，`chat_messages`逐条记录有序消息，`user_profiles`记录用户偏好。每轮流程为：
 
-4. 清理记忆
+1. 从SQLite读取当前session最近的消息，并加载user profile。
+2. 将本轮用户问题写入SQLite，再把历史作为标准消息传给Agent/ReAct。
+3. 回答成功后写入assistant消息；下轮或重启session时重新加载。
 
-```powershell
-python -m src.main memory-prune
-python -m src.main memory-clear --scope session --user-id u001 --session-id s001
-```
+消息按轮实时持久化，不会等退出chat后批量保存。`CHAT_HISTORY_LIMIT=20`表示最多加载最近20条消息，通常约10轮完整问答；更早消息仍保存在SQLite，但不会进入当前prompt。
+
+4. 当前限制
+
+- **自动Summary待开发**：`chat_sessions.summary`目前只是预留字段。超过20条消息后，旧消息不会自动总结，模型只能看到最近20条。
+- Chat历史读取只依赖SQLite；只有问题实际执行`rag_retrieve`时才会加载Embedding与Chroma。
+- 偏好可以保证被存储和注入，但最终格式仍受LLM指令遵循能力影响。
 
 ### 4.6 运行结果示例（实测输出摘录）
 
 以下结果来自本项目在本地环境的实际运行，便于快速对照。
 
-1. ask命令（全功能调度，自动走MCP）
+1. Session短期记忆
+
+首次启动隔离测试session：
+
+```powershell
+python -m src.main chat --user-id readme-memory-test --session-id readme-memory-20260805
+```
+
+第一轮询问PE计算时载入消息为0；第二轮询问“介绍一下静态PE”时，载入消息为2，回答沿用了上一轮的`8.25 / 0.68 = 12.13倍`。继续对话时，载入数按`0 -> 2 -> 4 -> 6 -> 8`增长。
+
+```text
+=== Chat Memory ===
+- 已载入消息: 2
+- 已载入用户偏好: 否
+- 消息写入: ok
+```
+
+退出后重新打开同一session并询问最初的问题，系统载入10条消息并准确回答：
+
+```text
+=== 回答 ===
+您在本session最开始问的是：“中信银行现价8.25元，每股收益EPS0.68，计算静态PE”。
+
+=== Chat Memory ===
+- 已载入消息: 10
+- 已载入用户偏好: 否
+- 消息写入: ok
+```
+
+该结果来自通用消息历史，没有“上一问”专用handler。
+
+2. User长期偏好
+
+在`readme-profile-s1`中输入：
+
+```text
+以后请用要点式回答，并在关键金融名词后用括号解释。
+```
+
+本轮状态显示`偏好写入: updated`。随后保持相同user、切换到新session询问“什么是静态PE？”：
+
+```text
+=== 回答 ===
+静态PE（静态市盈率，Price-to-Earnings Ratio）是指股票价格与每股收益（EPS，公司净利润除以总股本）的比值……
+
+=== Chat Memory ===
+- 已载入消息: 0
+- 已载入用户偏好: 是
+- 消息写入: ok
+```
+
+这证明profile已跨session加载，括号解释偏好也反映在回答中；“要点式”未稳定呈现，说明偏好注入不等于强制格式化。
+
+在涉及RAG检索的同一测试中，仍观察到Chroma telemetry的`capture()`参数警告；回答与Chat Memory写入均正常。普通历史追问未触发该警告。
+
+3. ask命令（全功能调度，自动走MCP）
 
 命令：
 
@@ -270,7 +331,7 @@ mcp_only
 - 已启用Agent级ReAct编排（Thought -> Action -> Observation）。
 ```
 
-2. ask命令（展示结构化ReAct轨迹）
+4. ask命令（展示结构化ReAct轨迹）
 
 命令：
 
@@ -301,7 +362,7 @@ Observation:
   结束循环并产出最终回答。
 ```
 
-3. agent-ask命令（RAG+MCP联合场景）
+5. agent-ask命令（RAG+MCP联合场景）
 
 命令：
 
@@ -413,33 +474,13 @@ rag_mcp
 
 ### 6.4 Memory机制演进
 
-当前版本已落地分层Memory机制，并完成第二阶段第一批稳定性增强。
+当前Chat Memory已实现SQLite会话消息与跨session用户偏好；RAG知识库保持独立，不属于对话记忆。
 
-已实现：
+待开发：
 
-1. 分层记忆
-- Session Memory：保存当前会话上下文。
-- User Memory：保存用户偏好画像。
-- Project Memory：保存项目级结论。
-
-2. 存储与治理
-- 存储架构：SQLite主存 + Chroma语义检索。
-- 默认TTL：30天，可通过命令手动清理。
-
-3. 第二阶段第一批（已实现）
-- 路由稳定化：对 `mcp_only / rag_mcp` 增加硬规则纠偏，降低同类问题漂移。
-- 用户画像写回分层：低置信度不覆盖，中置信度写“候选画像”，高置信度写“确认画像”，并与历史画像合并。
-
-后续建议：
-
-1. 注入预算与优先级
-- 对 session/user/project 记忆做预算分配与排序，降低噪声注入概率。
-
-2. 候选画像转正策略
-- 增加多轮一致性检查，避免单轮误判。
-
-3. 规则参数化
-- 将路由纠偏阈值与关键词配置化，支持按行业场景调优。
+1. **Session Summary**：历史超过窗口后，增量总结旧消息，并以“摘要 + 最近原始消息”组装prompt。
+2. **Token预算**：由固定消息条数升级为按模型上下文窗口动态裁剪。
+3. **偏好治理**：增加字段级来源、版本记录和更稳定的格式约束。
 
 ## 7. 如何构建自己的 Knowledge 库（不限银行业）
 

@@ -33,6 +33,7 @@ class Settings:
     memory_ttl_days: int = 30
     memory_collection: str = "agent_memory"
     memory_profile_min_confidence: float = 0.7
+    chat_history_limit: int = 20
 
 
 def _to_bool(value: str) -> bool:
@@ -85,4 +86,5 @@ def load_settings() -> Settings:
             0.0,
             min(1.0, float(os.getenv("MEMORY_PROFILE_MIN_CONFIDENCE", "0.7"))),
         ),
+        chat_history_limit=max(2, int(os.getenv("CHAT_HISTORY_LIMIT", "20"))),
     )
