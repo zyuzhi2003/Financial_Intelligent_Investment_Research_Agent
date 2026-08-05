@@ -1,10 +1,10 @@
-# 金融智能投研 Agent（RAG + MCP）
+# 金融智能投研 Agent
 
 语言选择：中文 | [English](README_EN.md)
 
 ## 目录
 
-- [金融智能投研 Agent（RAG + MCP）](#金融智能投研-agentrag--mcp)
+- [金融智能投研 Agent](#金融智能投研-agent)
   - [目录](#目录)
   - [1. 能力介绍](#1-能力介绍)
   - [2. 模型与技术栈说明](#2-模型与技术栈说明)

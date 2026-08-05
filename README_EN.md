@@ -1,10 +1,10 @@
-# Financial Intelligent Investment Research Agent (RAG + MCP)
+# Financial Intelligent Investment Research Agent
 
 Language: [中文](README.md) | English
 
 ## Table of Contents
 
-- [Financial Intelligent Investment Research Agent (RAG + MCP)](#financial-intelligent-investment-research-agent-rag--mcp)
+- [Financial Intelligent Investment Research Agent](#financial-intelligent-investment-research-agent)
   - [Table of Contents](#table-of-contents)
   - [1. Capabilities](#1-capabilities)
   - [2. Models and Tech Stack](#2-models-and-tech-stack)
