@@ -17,17 +17,12 @@ Language: [中文](README.md) | English
     - [4.5 Chat Memory](#45-chat-memory)
     - [4.6 Example outputs (real run excerpts)](#46-example-outputs-real-run-excerpts)
   - [5. Common Errors](#5-common-errors)
-  - [6. Future Roadmap](#6-future-roadmap)
-    - [6.1 MCP capability expansion](#61-mcp-capability-expansion)
-    - [6.2 Vector retrieval scaling path](#62-vector-retrieval-scaling-path)
-    - [6.3 Agent evolution](#63-agent-evolution)
-    - [6.4 Memory mechanism evolution](#64-memory-mechanism-evolution)
-  - [7. How to Build Your Own Knowledge Base (Not Limited to Banking)](#7-how-to-build-your-own-knowledge-base-not-limited-to-banking)
-    - [7.1 Single-Industry Knowledge Base (Recommended Starting Point)](#71-single-industry-knowledge-base-recommended-starting-point)
-    - [7.2 Multi-Industry Knowledge Base (Scaling Path)](#72-multi-industry-knowledge-base-scaling-path)
-    - [7.3 Document Quality Criteria (Critical for Retrieval Quality)](#73-document-quality-criteria-critical-for-retrieval-quality)
-    - [7.4 Recommended Build Workflow](#74-recommended-build-workflow)
-    - [7.5 Acceptance Criteria for a High-Quality Knowledge Base](#75-acceptance-criteria-for-a-high-quality-knowledge-base)
+  - [6. How to Build Your Own Knowledge Base (Not Limited to Banking)](#6-how-to-build-your-own-knowledge-base-not-limited-to-banking)
+    - [6.1 Single-Industry Knowledge Base (Recommended Starting Point)](#61-single-industry-knowledge-base-recommended-starting-point)
+    - [6.2 Multi-Industry Knowledge Base (Scaling Path)](#62-multi-industry-knowledge-base-scaling-path)
+    - [6.3 Document Quality Criteria (Critical for Retrieval Quality)](#63-document-quality-criteria-critical-for-retrieval-quality)
+    - [6.4 Recommended Build Workflow](#64-recommended-build-workflow)
+    - [6.5 Acceptance Criteria for a High-Quality Knowledge Base](#65-acceptance-criteria-for-a-high-quality-knowledge-base)
 
 This project is a localized intelligent research assistant for the banking domain. It combines report retrieval (RAG) and financial calculation (MCP) into one unified agent, covering the full flow from question understanding to retrieval, tool execution, and final conclusion.
 
@@ -76,9 +71,12 @@ Model roles:
 Core components:
 
 - Vector database: Chroma (local persistence under data/chroma)
-- Document parsing: PyPDFLoader (based on pypdf)
-- OCR preprocessing: PyMuPDF + RapidOCR
-- Text splitting: RecursiveCharacterTextSplitter
+- Document parsing: PyPDFLoader (based on pypdf) plus PyMuPDF structural parsing
+- OCR preprocessing: PyMuPDF + RapidOCR, with optional PaddleOCR PP-Structure
+- Text splitting: headings, sections, and paragraphs first; oversized sections fall back to RecursiveCharacterTextSplitter
+- Table splitting: native PDF tables use document structure; scanned tables recover rows and columns from OCR boxes, then split by rows while repeating headers
+- Special content: tables become standalone `chunk_type=table` chunks, while table-of-contents chart entries are filtered out
+- Table retrieval: independent keyword and vector retrieval are fused, with extra weight for bank names, years, metric terms, and `table_columns` so Chinese numeric tables are less likely to be displaced by body-text chunks
 - Orchestration framework: LangChain
 - Model client: ChatOpenAI
 - Environment management: python-dotenv
@@ -88,6 +86,7 @@ Core components:
 Key .env variables:
 
 - EMBEDDING_MODEL=BAAI/bge-small-zh-v1.5
+- EMBEDDING_FALLBACK_MODEL=sentence-transformers/all-MiniLM-L6-v2 (local cached fallback when the primary model cannot be downloaded)
 - OPENAI_MODEL=deepseek-chat
 - OPENAI_BASE_URL=https://api.deepseek.com/v1
 - OPENAI_API_KEY=... (or DEEPSEEK_API_KEY=...)
@@ -97,11 +96,96 @@ Key .env variables:
 - ENABLE_OCR=true
 - OCR_DPI=200
 - MIN_PAGE_CHARS=20
+- ENABLE_TABLE_OCR=false (enable scanned-PDF table recognition; increases processing time significantly)
 - ENABLE_REACT=true (enable ReAct retrieval-reasoning loop)
 - REACT_MAX_STEPS=3 (maximum ReAct iterations)
 - MEMORY_DIR=./data/memory (SQLite chat memory directory)
 - MEMORY_PROFILE_MIN_CONFIDENCE=0.7 (minimum confirmed profile confidence)
 - CHAT_HISTORY_LIMIT=20 (recent messages loaded for each chat turn)
+
+## 2.1 Key Capability: Structural and Table Chunking
+
+The project does not simply truncate each page by character count. It uses a structure-first strategy with length-based fallback:
+
+1. **Structural body chunking**
+  - Native PDFs are parsed with `PyMuPDF` text blocks, font sizes, and table regions.
+  - Section boundaries are detected from headings, numbered headings, and larger heading fonts.
+  - A section can span multiple pages while retaining `section`, `page`, and `page_end` metadata.
+  - `RecursiveCharacterTextSplitter` is used only when a section exceeds `CHUNK_SIZE`.
+
+2. **OCR table chunking for scanned PDFs**
+  - `RapidOCR` detects text together with quadrilateral coordinates.
+  - Text boxes are grouped into rows by vertical centers and sorted into cells by horizontal position.
+  - PaddleOCR `PPStructure` can enhance table detection; if its model or runtime is unavailable, the coordinate-based algorithm is used as a fallback.
+  - The result is a two-dimensional table instead of an unstructured text stream.
+
+3. **Multi-level header recovery**
+  - Parent headers are mapped to child period columns by horizontal ranges.
+  - For example, `Revenue` and `25Q1` become `Revenue-25Q1`.
+  - Financial-report groups such as growth, balance structure, sequential change, and year-over-year share receive dedicated mappings.
+  - If no reliable header is detected, `Column N` placeholders are used instead of treating the first data row as the header.
+
+4. **Standalone table chunks**
+  - Table rows are accumulated until the chunk reaches `CHUNK_SIZE`.
+  - Every table chunk repeats the complete header so it remains understandable without neighboring chunks.
+  - Metadata includes `chunk_type=table`, `table_part`, `table_parts`, and `table_columns`.
+  - Table-of-contents entries such as repeated `Chart N` labels are filtered to avoid false table detection.
+
+5. **Safe fallback**
+  - Scanned pages without detectable structure become page-level OCR text chunks.
+  - A table OCR failure does not stop index construction.
+  - `ENABLE_TABLE_OCR` is disabled by default because table inference adds significant processing time.
+  - If the primary embedding cannot be downloaded, the local `EMBEDDING_FALLBACK_MODEL` is tried automatically.
+
+6. **Table-aware answer context**
+  - Table retrieval fuses independent keyword and vector recall instead of relying only on vector top-k.
+  - ReAct observations preserve the table header and first data row so long headers cannot hide numeric values.
+  - Income questions distinguish amounts, growth rates, and reporting periods instead of treating a growth rate as an amount.
+
+### 2.2 Keyword and Vector Fusion Algorithm
+
+The current keyword channel is lightweight rule-based matching. It is not BM25 and does not call an LLM:
+
+1. Read stored `page_content`, `table_columns`, and metadata from Chroma independently.
+2. Normalize queries: `2024` becomes `24A`, `first half` becomes `H1`, and `second half` becomes `H2`.
+3. Extract Chinese entities, years, and periods with regular expressions, such as `ABC Bank`, `24A`, and `25Q1`.
+4. Apply metric aliases: `income/revenue -> operating revenue`, `profit -> net profit`.
+5. Run vector recall and keyword matching independently, then combine their scores:
+
+```text
+Final score =
+0.35 * vector rank score
++ 0.35 * keyword hit score
++ 0.10 * table-chunk bonus
++ 0.20 * exact entity hit score
+```
+
+**Advantages**
+
+- More stable for exact queries involving bank names, years, periods, and metric fields.
+- Table chunks use `table_columns`, reducing the chance that body-text chunks displace them.
+- No additional LLM call is required, so cost and latency are predictable and the result is explainable.
+- Suitable for the current local small-to-medium corpus and easy to debug by inspecting matched terms.
+
+**Limitations**
+
+- It is not standard BM25 and does not provide term frequency, inverse document frequency, or mature Chinese tokenization.
+- Keyword matching currently scans Chroma documents, which becomes less efficient at larger scale.
+- It depends on synonym and alias rules; uncovered expressions may not match.
+- Fixed weights require tuning against a real evaluation question set.
+- Complex semantics, implicit references, and cross-sentence reasoning still require vector retrieval or LLM reranking.
+
+For a larger corpus, replace the keyword channel with SQLite FTS5/BM25 while retaining Chroma vector recall and table-field weighting.
+
+Preview chunks from a specific PDF:
+
+```powershell
+conda activate agent
+$env:ENABLE_TABLE_OCR="true"
+python -m src.main preview-chunks --pdf "path/to/report.pdf" --max-pages 4 --limit 30 --chars 300
+```
+
+`type=section` represents structural body chunks. `type=table` represents standalone tables and includes `table_part=current/total` and `columns` in the preview.
 
 ## 3. Architecture
 
@@ -159,6 +243,12 @@ Quick smoke test (only a few PDFs):
 
 ```powershell
 python -m src.main build-index --max-pdfs 1
+```
+
+Build a single PDF or limit pages for table-index validation:
+
+```powershell
+python -m src.main build-index --pdf "path/to/report.pdf" --max-pages 4
 ```
 
 ### 4.4 Common commands
@@ -385,80 +475,7 @@ rag_mcp
 - Symptom: telemetry warnings in terminal output.
 - Fix: usually non-blocking; can be ignored temporarily. For a permanent fix, lock or upgrade related dependency versions.
 
-## 6. Future Roadmap
-
-### 6.1 MCP capability expansion
-
-Current MCP tools include calc_pe and calc_debt_ratio. Future expansion can build a banking research metrics toolkit:
-
-1. Valuation tools
-- Dividend yield
-- PB valuation and PB-ROE comparison
-- PEG valuation
-
-2. Asset quality and risk tools
-- NPL ratio
-- Provision coverage ratio
-- CET1 ratio
-
-3. Profitability tools
-- ROE/ROA and peer percentile comparison
-- NIM trend analysis
-- Cost-to-income ratio (CIR)
-
-4. Joint analysis tools
-- Auto-generate benchmark cards (industry average vs stock metrics)
-- Multi-period YoY/QoQ explanation
-- Structured RAG-linked conclusions (conclusion, evidence, risk)
-
-Recommended implementation:
-- Keep the current JSON protocol and register new tools with explicit parameter schema.
-- Add boundary checks and unit tests for each new tool to prevent metric-definition drift.
-
-### 6.2 Vector retrieval scaling path
-
-Chroma local persistence is suitable for demos and small-to-medium datasets. As scale grows (multi-industry, multi-year, million-level chunks), a staged upgrade is recommended:
-
-1. Medium scale (100k to 1M chunks)
-- Preferred: Milvus or Qdrant
-- Benefits: high-performance ANN, stronger filtering, containerized deployment, easier horizontal scaling
-
-2. Large-scale production (million+ chunks, multi-user concurrency)
-- Options: Elasticsearch/OpenSearch (hybrid vector + keyword retrieval)
-- Cloud-native options: Pinecone, Weaviate Cloud, Azure AI Search
-- Benefits: managed operations, elastic scaling, better monitoring and access control
-
-3. Recommended migration strategy
-- Step 1: keep retriever interface abstraction and add backend adapters.
-- Step 2: enable hybrid retrieval (vector recall + BM25 + reranker).
-- Step 3: add caching and evaluation metrics (hit rate, answer quality, latency, cost).
-
-### 6.3 Agent evolution
-
-1. Routing and tool orchestration
-- Upgrade from LLM-first to a three-stage policy: LLM decision + rule validation + confidence thresholds.
-- Add secondary checks for key fields (units, reporting-period consistency).
-
-2. Explainability
-- Add calculation-method notes, data timestamps, and evidence snippets.
-- Add uncertainty and coverage warnings for hybrid reasoning outputs.
-
-3. Engineering and operations
-- Add end-to-end regression suites and benchmark sets.
-- Add logs and tracing for diagnosing retrieval misses and MCP parameter issues.
-- Progressively support API service deployment and multi-session concurrency.
-
-### 6.4 Memory mechanism evolution
-
-The current Chat Memory implementation provides SQLite session messages and cross-session user preferences. The RAG knowledge base remains separate and is not conversation memory.
-
-Planned work:
-
-1. **Session Summary**: incrementally summarize messages outside the recent window and build prompts from summary + recent raw messages.
-2. **Token budget**: replace the fixed message count with model-aware context-window trimming.
-3. **Preference governance**: add field-level sources, version history, and stronger formatting controls.
-
-## 7. How to Build Your Own Knowledge Base (Not Limited to Banking)
+## 6. How to Build Your Own Knowledge Base (Not Limited to Banking)
 
 This project currently uses banking reports as the default example, but the same method works for both single-industry and multi-industry corpora. The key principles are:
 
@@ -466,7 +483,7 @@ This project currently uses banking reports as the default example, but the same
 2. Prioritize quality before volume.
 3. Make single-industry retrieval stable first, then scale to multi-industry.
 
-### 7.1 Single-Industry Knowledge Base (Recommended Starting Point)
+### 6.1 Single-Industry Knowledge Base (Recommended Starting Point)
 
 Best for course projects, demos, and focused research in one sector (for example banking, semiconductors, healthcare).
 
@@ -491,7 +508,7 @@ Recommended document mix and ratio (single industry):
 
 Note: slight ratio variation is fine, but avoid an extreme mix such as only short stock notes or only macro reports.
 
-### 7.2 Multi-Industry Knowledge Base (Scaling Path)
+### 6.2 Multi-Industry Knowledge Base (Scaling Path)
 
 Best for sector comparison, asset allocation, and cross-industry research.
 
@@ -517,7 +534,7 @@ Additional recommendations for multi-industry corpora:
 2. Route by sector first, then run vector retrieval.
 3. Avoid mixing metric definitions across sectors (valuation and profit-calculation conventions can differ).
 
-### 7.3 Document Quality Criteria (Critical for Retrieval Quality)
+### 6.3 Document Quality Criteria (Critical for Retrieval Quality)
 
 Prefer documents that are:
 
@@ -532,7 +549,7 @@ Remove or downweight documents that are:
 3. Too old with outdated logic.
 4. Highly repetitive reposts with little incremental information.
 
-### 7.4 Recommended Build Workflow
+### 6.4 Recommended Build Workflow
 
 1. Build folder structure and place PDFs by category (single-industry or multi-industry).
 2. Run a small indexing smoke test:
@@ -550,7 +567,7 @@ python -m src.main build-index --max-pdfs 10
 4. Check whether retrieval is relevant, citable, and explainable.
 5. Then scale up to the full corpus.
 
-### 7.5 Acceptance Criteria for a High-Quality Knowledge Base
+### 6.5 Acceptance Criteria for a High-Quality Knowledge Base
 
 Use these five checks:
 

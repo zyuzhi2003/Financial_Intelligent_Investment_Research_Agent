@@ -78,8 +78,15 @@ def _build_observation(docs: list[Document]) -> str:
     for idx, doc in enumerate(docs[:3], start=1):
         source = doc.metadata.get("source", "unknown")
         page = doc.metadata.get("page", "?")
+        if doc.metadata.get("chunk_type") == "table":
+            rows = doc.page_content.splitlines()
+            columns = str(doc.metadata.get("table_columns", ""))
+            first_row = rows[1] if len(rows) > 1 else ""
+            summary = _truncate(f"表头: {columns}\n首行数据: {first_row}", 520)
+        else:
+            summary = _truncate(doc.page_content)
         lines.append(
-            f"片段{idx}: {source}(页码:{page}) | 摘要: {_truncate(doc.page_content)}"
+            f"片段{idx}: {source}(页码:{page}) | 摘要: {summary}"
         )
     return "\n".join(lines)
 

@@ -34,6 +34,7 @@ class Settings:
     memory_collection: str = "agent_memory"
     memory_profile_min_confidence: float = 0.7
     chat_history_limit: int = 20
+    enable_table_ocr: bool = False
 
 
 def _to_bool(value: str) -> bool:
@@ -87,4 +88,5 @@ def load_settings() -> Settings:
             min(1.0, float(os.getenv("MEMORY_PROFILE_MIN_CONFIDENCE", "0.7"))),
         ),
         chat_history_limit=max(2, int(os.getenv("CHAT_HISTORY_LIMIT", "20"))),
+        enable_table_ocr=_to_bool(os.getenv("ENABLE_TABLE_OCR", "false")),
     )

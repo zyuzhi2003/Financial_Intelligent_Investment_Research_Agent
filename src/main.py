@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime
 import json
+from pathlib import Path
 import textwrap
 import uuid
 import typer
@@ -12,8 +13,9 @@ from src.config import load_settings
 from src.memory import ChatMemoryStore, HybridMemoryStore, MemoryScope
 from src.mcp import MCPDispatcher
 from src.mcp.nl_router import build_request_from_question
-from src.rag.build_index import build_vector_index
+from src.rag.build_index import _find_pdf_files, _load_documents, build_vector_index
 from src.rag.retriever import has_index
+from src.rag.structural_chunking import structural_split_documents
 
 app = typer.Typer(help="金融RAG+MCP智能问答系统")
 
@@ -93,10 +95,15 @@ def _to_memory_scope(scope: str) -> MemoryScope:
 
 @app.command("build-index")
 def build_index_cmd(
+    pdf: str = typer.Option("", "--pdf", help="指定要构建索引的单个PDF路径"),
     max_pdfs: int = typer.Option(0, "--max-pdfs", help="仅处理前N个PDF，0表示全部"),
+    max_pages: int = typer.Option(0, "--max-pages", help="每个PDF仅处理前N页，0表示全部"),
     quiet: bool = typer.Option(False, "--quiet", help="减少过程日志输出"),
 ) -> None:
     settings = load_settings()
+    pdf_path = Path(pdf) if pdf.strip() else None
+    if pdf_path is not None and not pdf_path.is_file():
+        raise typer.BadParameter(f"PDF文件不存在: {pdf_path}")
     typer.echo(
         f"启动 build-index: knowledge_dir={settings.knowledge_dir}, "
         f"enable_ocr={settings.enable_ocr}, ocr_dpi={settings.ocr_dpi}, max_pdfs={max_pdfs}"
@@ -106,8 +113,58 @@ def build_index_cmd(
         settings,
         max_pdfs=(None if max_pdfs <= 0 else max_pdfs),
         logger=logger,
+        pdf_path=pdf_path,
+        max_pages=(None if max_pages <= 0 else max_pages),
     )
     typer.echo(f"索引构建完成: PDF={pdf_count}, 切片={chunk_count}")
+
+
+@app.command("preview-chunks")
+def preview_chunks_cmd(
+    pdf: str = typer.Option("", "--pdf", help="指定要预览的PDF路径"),
+    max_pdfs: int = typer.Option(1, "--max-pdfs", help="仅预览前N个PDF，0表示全部"),
+    max_pages: int = typer.Option(0, "--max-pages", help="仅预览前N页，0表示全部"),
+    limit: int = typer.Option(20, "--limit", help="最多展示的片段数量"),
+    chars: int = typer.Option(500, "--chars", help="每个片段最多展示的字符数"),
+) -> None:
+    settings = load_settings()
+    pdf_files = [Path(pdf)] if pdf.strip() else _find_pdf_files(settings.knowledge_dir)
+    if pdf and not pdf_files[0].is_file():
+        raise typer.BadParameter(f"PDF文件不存在: {pdf_files[0]}")
+    if not pdf and max_pdfs > 0:
+        pdf_files = pdf_files[:max_pdfs]
+    if not pdf_files:
+        raise typer.BadParameter(f"未在目录中找到PDF文件: {settings.knowledge_dir}")
+
+    raw_docs, stats = _load_documents(
+        pdf_files,
+        settings,
+        logger=print,
+        max_pages=(None if max_pages <= 0 else max_pages),
+    )
+    chunks = structural_split_documents(raw_docs, settings)
+    typer.echo(
+        f"预览完成: PDF={len(pdf_files)}, 原始页={len(raw_docs)}, "
+        f"切片={len(chunks)}, OCR页={stats['ocr_pages']}, "
+        f"表格页={stats.get('table_pages', 0)}, 表格数={stats.get('table_count', 0)}"
+    )
+    for index, chunk in enumerate(chunks[: max(0, limit)], start=1):
+        metadata = chunk.metadata
+        content = chunk.page_content.replace("\n", " / ").strip()
+        if len(content) > chars:
+            content = content[:chars] + "..."
+        table_info = ""
+        if metadata.get("chunk_type") == "table":
+            table_info = (
+                f" table_part={metadata.get('table_part')}/{metadata.get('table_parts')}"
+                f" columns={metadata.get('table_columns', '')!r}"
+            )
+        typer.echo(
+            f"\n[{index}] type={metadata.get('chunk_type', 'unknown')} "
+            f"section={metadata.get('section', '')!r} "
+            f"page={metadata.get('page', '?')}-{metadata.get('page_end', metadata.get('page', '?'))} "
+            f"length={len(chunk.page_content)}{table_info}\n{content}"
+        )
 
 
 @app.command("ask")

@@ -7,11 +7,10 @@ from typing import Callable, Iterable, List
 from langchain_chroma import Chroma
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_core.documents import Document
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-
 from src.config import Settings
 from src.rag.embeddings import create_embeddings
-from src.rag.ocr import extract_pdf_pages_text
+from src.rag.ocr import extract_pdf_pages_tables, extract_pdf_pages_text
+from src.rag.structural_chunking import structural_split_documents
 
 
 def _find_pdf_files(knowledge_dir: Path) -> List[Path]:
@@ -19,7 +18,10 @@ def _find_pdf_files(knowledge_dir: Path) -> List[Path]:
 
 
 def _load_documents(
-    pdf_files: Iterable[Path], settings: Settings, logger: Callable[[str], None] | None
+    pdf_files: Iterable[Path],
+    settings: Settings,
+    logger: Callable[[str], None] | None,
+    max_pages: int | None = None,
 ) -> tuple[List[Document], dict[str, int]]:
     docs: List[Document] = []
     stats = {
@@ -27,6 +29,8 @@ def _load_documents(
         "page_count": 0,
         "direct_pages": 0,
         "ocr_pages": 0,
+        "table_pages": 0,
+        "table_count": 0,
         "empty_pages": 0,
     }
 
@@ -39,6 +43,8 @@ def _load_documents(
 
         loader = PyPDFLoader(str(pdf))
         loaded = loader.load()
+        if max_pages and max_pages > 0:
+            loaded = loaded[:max_pages]
         stats["file_count"] += 1
         stats["page_count"] += len(loaded)
 
@@ -59,7 +65,17 @@ def _load_documents(
                 logger(
                     f"  - OCR处理中: {len(empty_page_indexes)} 页 (dpi={settings.ocr_dpi})"
                 )
-            ocr_texts = extract_pdf_pages_text(pdf, empty_page_indexes, settings.ocr_dpi)
+            ocr_results: dict[int, object] = {}
+            ocr_texts = extract_pdf_pages_text(
+                pdf, empty_page_indexes, settings.ocr_dpi, ocr_results
+            )
+            ocr_tables = (
+                extract_pdf_pages_tables(
+                    pdf, empty_page_indexes, settings.ocr_dpi, ocr_results
+                )
+                if settings.enable_table_ocr
+                else {}
+            )
             ocr_hit_pages = 0
             for item in loaded:
                 page_idx = item.metadata.get("page")
@@ -68,9 +84,13 @@ def _load_documents(
                 ocr_text = (ocr_texts.get(page_idx) or "").strip()
                 if len(ocr_text) >= settings.min_page_chars:
                     item.page_content = ocr_text
+                    item.metadata["_ocr_tables"] = ocr_tables.get(page_idx, [])
                     docs.append(item)
                     ocr_hit_pages += 1
                     stats["ocr_pages"] += 1
+                    if ocr_tables.get(page_idx):
+                        stats["table_pages"] += 1
+                        stats["table_count"] += len(ocr_tables[page_idx])
             stats["empty_pages"] += max(0, len(empty_page_indexes) - ocr_hit_pages)
             if logger:
                 logger(f"  - OCR完成: 命中 {ocr_hit_pages} 页")
@@ -90,8 +110,10 @@ def build_vector_index(
     settings: Settings,
     max_pdfs: int | None = None,
     logger: Callable[[str], None] | None = print,
+    pdf_path: Path | None = None,
+    max_pages: int | None = None,
 ) -> tuple[int, int]:
-    pdf_files = _find_pdf_files(settings.knowledge_dir)
+    pdf_files = [pdf_path] if pdf_path else _find_pdf_files(settings.knowledge_dir)
     if not pdf_files:
         raise FileNotFoundError(f"未在目录中找到PDF文件: {settings.knowledge_dir}")
     if max_pdfs and max_pdfs > 0:
@@ -100,7 +122,7 @@ def build_vector_index(
     if logger:
         logger(f"开始构建索引: 文件数={len(pdf_files)}")
 
-    raw_docs, stats = _load_documents(pdf_files, settings, logger)
+    raw_docs, stats = _load_documents(pdf_files, settings, logger, max_pages=max_pages)
     if not raw_docs:
         raise ValueError(
             "未从PDF中提取到有效文本。可能是扫描版PDF或字体加密导致。"
@@ -114,11 +136,7 @@ def build_vector_index(
             f"OCR命中页={stats['ocr_pages']} 仍为空页={stats['empty_pages']}"
         )
 
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=settings.chunk_size,
-        chunk_overlap=settings.chunk_overlap,
-    )
-    chunks = splitter.split_documents(raw_docs)
+    chunks = structural_split_documents(raw_docs, settings)
     if not chunks:
         raise ValueError(
             "文本切分后结果为空，无法构建索引。"

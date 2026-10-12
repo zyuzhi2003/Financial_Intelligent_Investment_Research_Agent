@@ -141,24 +141,33 @@ class AgentRouter:
             content=question,
         )
         intent = self._stabilize_intent(question, classify_intent(question, self._settings))
-        if self._settings.enable_react:
-            try:
-                output = self._handle_agent_level_react(
-                    question,
-                    intent,
-                    conversation_messages=conversation_messages,
-                )
-            except Exception:  # noqa: BLE001
+        try:
+            if self._settings.enable_react:
+                try:
+                    output = self._handle_agent_level_react(
+                        question,
+                        intent,
+                        conversation_messages=conversation_messages,
+                    )
+                except Exception:  # noqa: BLE001
+                    output = self._dispatch_legacy(
+                        question,
+                        intent,
+                        conversation_messages=conversation_messages,
+                    )
+            else:
                 output = self._dispatch_legacy(
                     question,
                     intent,
                     conversation_messages=conversation_messages,
                 )
-        else:
-            output = self._dispatch_legacy(
-                question,
-                intent,
-                conversation_messages=conversation_messages,
+        except Exception as exc:  # noqa: BLE001
+            output = RouteOutput(
+                intent.route,
+                "当前请求暂时无法执行，请确认向量索引、模型服务和 API 配置后重试。",
+                [intent.reason, f"执行失败：{type(exc).__name__}"],
+                [],
+                {"error_type": type(exc).__name__},
             )
 
         chat_memory.append_message(
@@ -291,7 +300,16 @@ class AgentRouter:
         for idx, doc in enumerate(docs[:2], start=1):
             source = doc.metadata.get("source", "unknown")
             page = doc.metadata.get("page", "?")
-            summary = self._truncate(doc.page_content)
+            if doc.metadata.get("chunk_type") == "table":
+                rows = doc.page_content.splitlines()
+                columns = str(doc.metadata.get("table_columns", ""))
+                first_row = rows[1] if len(rows) > 1 else ""
+                summary = self._truncate(
+                    f"表头: {columns}\n首行数据: {first_row}",
+                    max_len=520,
+                )
+            else:
+                summary = self._truncate(doc.page_content)
             lines.append(f"片段{idx}: {source}(页码:{page}) | 摘要: {summary}")
         return "\n".join(lines)
 
@@ -1013,7 +1031,12 @@ class AgentRouter:
         conversation_messages: list[BaseMessage] | None = None,
     ) -> str:
         # 这个函数用于提供轻量常识兜底回复。
-        if conversation_messages and self._settings.openai_api_key:
+        usable_api_key = self._settings.openai_api_key.strip() not in {
+            "",
+            "your_deepseek_api_key_here",
+            "your_openai_api_key_here",
+        }
+        if conversation_messages and usable_api_key:
             llm = ChatOpenAI(
                 model=self._settings.openai_model,
                 temperature=0,
@@ -1025,7 +1048,10 @@ class AgentRouter:
             ]
             messages.extend(conversation_messages)
             messages.append(HumanMessage(content=question))
-            return str(llm.invoke(messages).content)
+            try:
+                return str(llm.invoke(messages).content)
+            except Exception:
+                pass
 
         if "拨备覆盖率" in question:
             return (

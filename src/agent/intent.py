@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 import json
+import re
 from typing import TYPE_CHECKING
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -47,6 +48,11 @@ def _rule_based_classify(question: str) -> IntentResult:
         keyword in text
         for keyword in ["研报", "政策", "净息差", "不良率", "资本充足率", "财报", "AUM", "银行业"]
     )
+    has_financial_fact = any(
+        keyword in text for keyword in ["收入", "营收", "净利润", "业绩", "贷款", "资产", "负债"]
+    )
+    has_time_marker = bool(re.search(r"20\d{2}|上半年|下半年|一季度|二季度|三季度|四季度|[0-9]{2}年", text))
+    has_company_or_industry = any(keyword in text for keyword in ["银行", "公司", "股份行", "上市"])
 
     if (has_pe_word or has_debt_word) and has_numeric_data and has_industry_word:
         return IntentResult(
@@ -64,6 +70,12 @@ def _rule_based_classify(question: str) -> IntentResult:
         return IntentResult(
             route=RouteType.RAG_ONLY,
             reason="检测到研报/政策/基本面检索词，走RAG路径。",
+        )
+
+    if has_company_or_industry and (has_financial_fact or has_time_marker):
+        return IntentResult(
+            route=RouteType.RAG_ONLY,
+            reason="检测到银行/公司财务事实查询，走RAG路径。",
         )
 
     return IntentResult(
